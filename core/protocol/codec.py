@@ -1,0 +1,265 @@
+"""Binary frame encoder/decoder for ChitChat chat protocol.
+
+Frame format (TLV + header):
+  [2 bytes] magic: 0x4343 ("CC" = ChitChat)
+  [1 byte]  version
+  [4 bytes] payload length L
+  [4 bytes] message_id length N
+  [N bytes] message_id (UUID hex)
+  [1 byte]  source_device length M
+  [M bytes] source_device
+  [L bytes] payload (JSON-serialized content metadata + format descriptors)
+
+Chat payload JSON structure:
+{
+  "msg_type": "chat_text",
+  "text": "hello",
+  "timestamp": 1234567890.123,
+  ...
+}
+
+File transfer payload JSON structures:
+  file_request:  {"msg_type": "file_request", "transfer_id": "...",
+                  "file_name": "...", "file_size": N, "mime_type": "..."}
+  file_chunk:    {"msg_type": "file_chunk", "transfer_id": "...",
+                  "chunk_index": N, "total_chunks": N, "data": "<base64>"}
+  file_ack:      {"msg_type": "file_ack", "transfer_id": "..."}
+  file_reject:   {"msg_type": "file_reject", "transfer_id": "..."}
+  file_complete: {"msg_type": "file_complete", "transfer_id": "...", "status": "..."}
+
+If "msg_type" is absent from the payload, it defaults to "chat_text" for
+backward compatibility.
+"""
+
+import base64
+import json
+import logging
+import struct
+import time
+import uuid
+from dataclasses import dataclass, field
+from io import BytesIO
+
+logger = logging.getLogger(__name__)
+
+MAGIC = 0x4343  # "CC" for ChitChat (JSON frames)
+BINARY_MAGIC = 0x4243  # "BC" for binary payload frames (file chunks)
+VERSION = 2
+HEADER_FMT = ">H B I"  # magic, version, payload_length
+HEADER_SIZE = 7
+
+# Valid chat message types
+CHAT_MSG_TYPES = frozenset({
+    "chat_text", "chat_image", "chat_file", "typing", "read_receipt",
+    "reaction", "presence", "ack", "ping", "pong",
+})
+
+# Valid message types for file transfer routing
+FILE_TRANSFER_MSG_TYPES = frozenset({
+    "file_request", "file_chunk", "file_ack", "file_reject", "file_complete",
+    "file_chunk_ack", "file_pause", "file_resume",
+})
+
+
+@dataclass
+class ChatMessage:
+    """Generic chat message container.
+
+    The ``msg_type`` attribute identifies the message kind:
+      - ``chat_text``, ``chat_image``, ``chat_file`` — content messages
+      - ``typing`` — typing indicator
+      - ``read_receipt`` — message read confirmation
+      - ``reaction`` — emoji/reaction to a message
+      - ``presence`` — online/offline status
+      - ``ack``, ``ping``, ``pong`` — protocol-level messages
+
+    The raw decoded payload dict is stored as ``_raw_payload`` so that
+    handlers can access the full message body without a second
+    deserialization.
+    """
+    msg_type: str = "chat_text"
+    msg_id: str = ""
+    source_device: str = ""
+    timestamp: float = 0.0
+    _raw_payload: dict = field(default_factory=dict)
+
+
+def encode_frame(payload_dict: dict, msg_id: str = "", source_device: str = "") -> bytes:
+    """Encode a generic JSON payload dict into the binary frame format.
+
+    This is the low-level encoder used by both chat messages and file transfers.
+    Any dict can be passed as the payload; it will be JSON-serialized and wrapped
+    in the standard ChitChat binary frame.
+    """
+    payload_bytes = json.dumps(payload_dict, ensure_ascii=False).encode("utf-8")
+
+    msg_id_bytes = (msg_id or uuid.uuid4().hex).encode("ascii")
+    src_str = source_device[:255]
+    while True:
+        src_bytes = src_str.encode("utf-8")
+        if len(src_bytes) <= 255:
+            break
+        src_str = src_str[:-1]  # trim one char to avoid mid-codepoint truncation
+
+    buf = BytesIO()
+    buf.write(struct.pack(HEADER_FMT, MAGIC, VERSION, len(payload_bytes)))
+    buf.write(struct.pack(">I", len(msg_id_bytes)))
+    buf.write(msg_id_bytes)
+    buf.write(struct.pack(">B", len(src_bytes)))
+    buf.write(src_bytes)
+    buf.write(payload_bytes)
+
+    return buf.getvalue()
+
+
+# TODO: Replace zlib compression on file chunks with a simpler approach
+# (e.g., no compression, or a per-transfer negotiated codec). The original
+# ClipSync codec used zlib for non-PNG raster images; ChitChat currently
+# skips compression in encode_binary_chunk and relies on higher-level
+# transfer negotiation.
+def encode_binary_chunk(transfer_id: str, chunk_index: int,
+                        total_chunks: int, raw_data: bytes) -> bytes:
+    """Encode a file chunk as a compact binary frame (no base64/JSON overhead).
+
+    Binary frame format::
+
+      [2 bytes]  magic: 0x4243 ("BC")
+      [32 bytes] transfer_id (ascii hex UUID)
+      [4 bytes]  chunk_index (uint32, big-endian)
+      [4 bytes]  total_chunks (uint32, big-endian)
+      [4 bytes]  data_length (uint32, big-endian)
+      [N bytes]  raw chunk data
+
+    Total header: 46 bytes.
+    """
+    tid_bytes = transfer_id.encode("ascii")
+    if len(tid_bytes) != 32:
+        raise ValueError(f"transfer_id must be 32 hex chars, got {len(tid_bytes)}")
+    header = struct.pack(
+        ">H32sIII",
+        BINARY_MAGIC,
+        tid_bytes,
+        chunk_index,
+        total_chunks,
+        len(raw_data),
+    )
+    return header + raw_data
+
+
+def _decode_binary_frame(data: bytes):
+    """Decode a binary frame into a ChatMessage, or return None."""
+    BIN_HEADER_SIZE = 2 + 32 + 4 + 4 + 4  # 46 bytes
+    if len(data) < BIN_HEADER_SIZE:
+        return None
+    magic, tid_bytes, chunk_index, total_chunks, data_len = struct.unpack_from(
+        ">H32sIII", data, 0,
+    )
+    if magic != BINARY_MAGIC:
+        return None
+    if BIN_HEADER_SIZE + data_len > len(data):
+        return None
+    try:
+        transfer_id = tid_bytes.decode("ascii")
+    except (UnicodeDecodeError, ValueError):
+        return None
+    raw_data = data[BIN_HEADER_SIZE:BIN_HEADER_SIZE + data_len]
+
+    result = ChatMessage(
+        msg_type="file_chunk",
+        msg_id=transfer_id,
+        source_device="",
+        timestamp=time.time(),
+    )
+    result._raw_payload = {
+        "msg_type": "file_chunk",
+        "transfer_id": transfer_id,
+        "chunk_index": chunk_index,
+        "total_chunks": total_chunks,
+        "_raw_data": raw_data,
+    }
+    return result
+
+
+def decode_message(data: bytes) -> ChatMessage | None:
+    """Decode wire format bytes to a ChatMessage, or None if invalid.
+
+    The returned ChatMessage will have a ``msg_type`` attribute set:
+      - ``chat_text``, ``chat_image``, ``chat_file``, ``typing``,
+        ``read_receipt``, ``reaction``, ``presence`` for chat messages.
+      - One of the ``FILE_TRANSFER_MSG_TYPES`` for file transfers.
+      - Falls back to ``chat_text`` if the ``msg_type`` field is missing
+        from the JSON payload (backward compatibility).
+
+    The raw decoded payload dict is stored as ``_raw_payload`` on the
+    returned object so that handlers can access the full message body
+    without a second deserialization.
+    """
+    if len(data) < HEADER_SIZE:
+        return None
+
+    # Route binary frames to the dedicated decoder
+    if len(data) >= 2:
+        first_two = struct.unpack_from(">H", data, 0)[0]
+        if first_two == BINARY_MAGIC:
+            return _decode_binary_frame(data)
+
+    magic, version, payload_len = struct.unpack_from(HEADER_FMT, data, 0)
+    if magic != MAGIC:
+        logger.debug("Frame magic mismatch: expected 0x%04x, got 0x%04x", MAGIC, magic)
+        return None
+    if version < 1 or version > VERSION:
+        logger.debug("Frame version out of range: got %d, accepted [1, %d]", version, VERSION)
+        return None
+
+    offset = HEADER_SIZE
+
+    if offset + 4 > len(data):
+        return None
+    msg_id_len = struct.unpack_from(">I", data, offset)[0]
+    offset += 4
+
+    if offset + msg_id_len > len(data):
+        return None
+    try:
+        msg_id = data[offset:offset + msg_id_len].decode("ascii")
+    except (UnicodeDecodeError, ValueError):
+        return None
+    offset += msg_id_len
+
+    if offset + 1 > len(data):
+        return None
+    src_len = struct.unpack_from(">B", data, offset)[0]
+    offset += 1
+
+    if offset + src_len > len(data):
+        return None
+    try:
+        source_device = data[offset:offset + src_len].decode("utf-8")
+    except (UnicodeDecodeError, ValueError):
+        return None
+    offset += src_len
+
+    if offset + payload_len > len(data):
+        return None
+    payload_bytes = data[offset:offset + payload_len]
+
+    try:
+        payload = json.loads(payload_bytes.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return None
+
+    # Extract message type (backward-compatible: default to "chat_text")
+    msg_type = payload.get("msg_type", "chat_text")
+
+    result = ChatMessage(
+        msg_type=msg_type,
+        msg_id=msg_id,
+        source_device=source_device,
+        timestamp=payload.get("timestamp", 0.0),
+    )
+
+    # Attach metadata so callers can inspect the full message body without
+    # re-parsing the raw bytes.
+    result._raw_payload = payload
+
+    return result
