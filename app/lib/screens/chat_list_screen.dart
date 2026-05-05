@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import '../services/daemon_service.dart';
-import 'chat_screen.dart';
+import 'package:chitchat/services/daemon_service.dart';
+import 'package:chitchat/screens/chat_screen.dart';
+import 'package:chitchat/screens/settings_screen.dart';
+import 'package:chitchat/widgets/connection_indicator.dart';
 
 class ChatListScreen extends StatelessWidget {
   const ChatListScreen({super.key});
@@ -58,12 +60,16 @@ class ChatListScreen extends StatelessWidget {
                   '${connectedPeers.length} online',
                   style: TextStyle(color: connectedPeers.isNotEmpty ? Colors.greenAccent : Colors.white38, fontSize: 13),
                 ),
+                const SizedBox(height: 4),
+                const ConnectionIndicator(),
               ],
             ),
           ),
           IconButton(
             icon: const Icon(Icons.settings_outlined),
-            onPressed: () {},
+            onPressed: () {
+              Navigator.push(context, MaterialPageRoute(builder: (_) => const SettingsScreen()));
+            },
             tooltip: 'Settings',
           ),
         ],

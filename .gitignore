@@ -15,17 +15,28 @@ build/
 .metadata
 
 # Go
-server/server
+server/relay-server
+server/relay-server.exe
 
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Data
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ChitChat runtime data
 *.db
+*.db-shm
+*.db-wal
 *.pem
 device_id
+~/.chitchat/

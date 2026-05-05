@@ -125,6 +125,8 @@ class Discovery:
         self._display_name = device_name[:8] if device_name else "ChitChat"
         self._port = port
         self._service_type = service_type
+        if not self._service_type.endswith(".local."):
+            self._service_type += ".local."
         self._zc: Zeroconf | None = None
         self._service_info: ServiceInfo | None = None
         self._browser: ServiceBrowser | None = None

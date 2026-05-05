@@ -1,6 +1,7 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import '../services/daemon_service.dart';
+import 'package:chitchat/services/daemon_service.dart';
 
 class ChatScreen extends StatefulWidget {
   final String peerId;
