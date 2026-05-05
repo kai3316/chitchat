@@ -1,46 +1,42 @@
 #!/usr/bin/env bash
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="$SCRIPT_DIR/.venv"
-PYTHON=""
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV="$ROOT/.venv"
 
-# Find Python 3
-for cmd in python3 python; do
-    if command -v "$cmd" &>/dev/null; then
-        ver=$("$cmd" --version 2>&1)
-        if [[ "$ver" == *"Python 3"* ]]; then
-            PYTHON="$cmd"
-            break
-        fi
-    fi
-done
-
-if [ -z "$PYTHON" ]; then
-    echo "Python 3.10+ is required but was not found." >&2
+# Find python (venv first, then system)
+if [ -f "$VENV/bin/python" ]; then
+    PYTHON="$VENV/bin/python"
+elif command -v python3 &>/dev/null; then
+    PYTHON="python3"
+elif command -v python &>/dev/null; then
+    PYTHON="python"
+else
+    echo "Python 3.10+ not found. Install it then run: python3 setup.py"
     exit 1
 fi
 
-# --setup flag: first-time setup
-if [ "$1" = "--setup" ]; then
-    echo "Creating virtual environment at \"$VENV_DIR\"..."
-    "$PYTHON" -m venv "$VENV_DIR"
-    echo "Installing dependencies..."
-    source "$VENV_DIR/bin/activate"
-    pip install -r "$SCRIPT_DIR/requirements.txt"
-    echo ""
-    echo "Setup complete. Run run.sh without --setup to start ChitChat."
-    exit 0
+# First-time setup if no venv
+if [ ! -f "$VENV/bin/python" ]; then
+    echo "First time? Running setup..."
+    "$PYTHON" "$ROOT/setup.py"
+    if [ -f "$VENV/bin/python" ]; then
+        PYTHON="$VENV/bin/python"
+    fi
 fi
 
-# Ensure venv exists
-if [ ! -f "$VENV_DIR/bin/python" ]; then
-    echo "Virtual environment not found. Creating..."
-    "$PYTHON" -m venv "$VENV_DIR"
-    echo "Installing dependencies..."
-    source "$VENV_DIR/bin/activate"
-    pip install -r "$SCRIPT_DIR/requirements.txt"
-fi
+# Auto-detect LAN IP
+LAN_IP=$(ip route get 1 2>/dev/null | awk '{print $7; exit}' 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
 
-# Run the daemon, passing through all arguments
-exec "$VENV_DIR/bin/python" -m core.daemon "$@"
+# Auto-name from hostname if not specified
+HAS_NAME=0
+for arg in "$@"; do
+    [[ "$arg" == "--name" || "$arg" == "-n" ]] && HAS_NAME=1
+done
+
+if [ "$HAS_NAME" -eq 0 ]; then
+    echo "Starting ChitChat daemon on port 9875..."
+    exec "$PYTHON" -m core.daemon --name "$(hostname)"
+else
+    exec "$PYTHON" -m core.daemon "$@"
+fi

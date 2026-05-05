@@ -1,51 +1,52 @@
 @echo off
 setlocal enabledelayedexpansion
+title ChitChat Daemon
 
-set "SCRIPT_DIR=%~dp0"
-set "VENV_DIR=%SCRIPT_DIR%.venv"
-set "PYTHON="
+set "ROOT=%~dp0"
+set "VENV=%ROOT%.venv"
 
-:: Find Python 3
-where python3 >nul 2>&1
-if %ERRORLEVEL% EQU 0 (
-    set "PYTHON=python3"
+:: Find python in venv or system
+if exist "%VENV%\Scripts\python.exe" (
+    set "PYTHON=%VENV%\Scripts\python.exe"
 ) else (
-    where python >nul 2>&1
-    if %ERRORLEVEL% EQU 0 (
-        set "PYTHON=python"
-    ) else (
-        echo Python 3.10+ is required but was not found.
-        exit /b 1
+    where python3 >nul 2>&1 && (set "PYTHON=python3") || (
+        where python >nul 2>&1 && (set "PYTHON=python") || (
+            echo Python 3.10+ not found. Install from https://python.org
+            echo Then run: python "%ROOT%setup.py"
+            pause
+            exit /b 1
+        )
     )
 )
 
-:: Verify it is Python 3
-%PYTHON% --version 2>&1 | findstr "Python 3" >nul
-if %ERRORLEVEL% NEQ 0 (
-    echo Python 3.10+ is required.
-    exit /b 1
+:: First-time setup hint
+if not exist "%VENV%\Scripts\python.exe" (
+    echo First time? Running setup...
+    "%PYTHON%" "%ROOT%setup.py"
+    if exist "%VENV%\Scripts\python.exe" (set "PYTHON=%VENV%\Scripts\python.exe")
 )
 
-:: --setup flag: first-time setup
-if "%1"=="--setup" (
-    echo Creating virtual environment at "%VENV_DIR%"...
-    %PYTHON% -m venv "%VENV_DIR%"
-    echo Installing dependencies...
-    call "%VENV_DIR%\Scripts\activate.bat"
-    pip install -r "%SCRIPT_DIR%requirements.txt"
-    echo.
-    echo Setup complete. Run run.bat without --setup to start ChitChat.
-    exit /b 0
+:: Detect local IP for display
+for /f "tokens=2 delims=:" %%a in ('ipconfig ^| findstr /c:"IPv4" 2^>nul') do (
+    set "LAN_IP=%%a"
+    set "LAN_IP=!LAN_IP: =!"
 )
 
-:: Ensure venv exists
-if not exist "%VENV_DIR%\Scripts\python.exe" (
-    echo Virtual environment not found. Creating...
-    %PYTHON% -m venv "%VENV_DIR%"
-    echo Installing dependencies...
-    call "%VENV_DIR%\Scripts\activate.bat"
-    pip install -r "%SCRIPT_DIR%requirements.txt"
+:: Run daemon with friendly name if not provided
+set "HAS_NAME=0"
+:parse_args
+if "%~1"=="" goto :run
+if /i "%~1"=="--name" set "HAS_NAME=1"
+if /i "%~1"=="-n" set "HAS_NAME=1"
+shift
+goto :parse_args
+
+:run
+if "%HAS_NAME%"=="0" (
+    echo Starting ChitChat daemon on port 9875...
+    "%PYTHON%" -m core.daemon --name "%COMPUTERNAME%"
+) else (
+    "%PYTHON%" -m core.daemon %*
 )
 
-:: Run the daemon, passing through all arguments
-"%VENV_DIR%\Scripts\python.exe" -m core.daemon %*
+pause

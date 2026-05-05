@@ -45,25 +45,25 @@ encrypted with TLS 1.3 and AES-256-GCM.
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                          PYTHON DAEMON (core/)                          │
 │                                                                         │
-│   ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌─────────┐ │
-│   │ Discovery│  │ Transport│  │ Security │  │  Relay   │  │  Store  │ │
-│   │  (mDNS)  │  │  (TCP)   │  │  (TLS)   │  │ (WS Tx)  │  │ (SQLite)│ │
-│   └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬────┘ │
+│   ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌─────────┐   │
+│   │ Discovery│  │ Transport│  │ Security │  │  Relay   │  │  Store  │   │
+│   │  (mDNS)  │  │  (TCP)   │  │  (TLS)   │  │ (WS Tx)  │  │ (SQLite)│   │
+│   └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬────┘   │
 │        │             │             │             │             │        │
-│   mDNS │             │       TCP + TLS 1.3       │      WebSocket        │
-│   SRV  │             │    AES-256-GCM (E2E)      │                       │
-│        ▼             ▼                           ▼                       │
+│   mDNS │             │       TCP + TLS 1.3       │      WebSocket       │
+│   SRV  │             │    AES-256-GCM (E2E)      │                      │
+│        ▼             ▼                           ▼                      │
 └───────────────┬──────────────────┬──────────────────────────────────────┘
                 │                  │
-       P2P LAN │                  │ Internet / WAN
-     (direct)  │                  │ (relay fallback)
-               ▼                  ▼
-      ┌──────────────┐   ┌──────────────────┐
-      │   Peer B     │   │  GO RELAY SERVER │
-      │  (same LAN)  │   │  (server/main.go) │
-      │              │   │  ~8 MB binary     │
-      └──────────────┘   │  WebSocket hub    │
-                         └──────────┬─────────┘
+       P2P LAN  │                  │ Internet / WAN
+      (direct)  │                  │ (relay fallback)
+                ▼                  ▼
+      ┌──────────────┐     ┌───────────────────┐
+      │   Peer B     │     │  GO RELAY SERVER  │
+      │  (same LAN)  │     │  (server/main.go) │
+      │              │     │  ~8 MB binary     │
+      └──────────────┘     │  WebSocket hub    │
+                           └────────┬──────────┘
                                     │
                                     ▼
                               ┌──────────┐
@@ -131,53 +131,102 @@ chitchat/
   docs/               GitHub Pages landing page
 ```
 
-## Quick Start
+## Quick Start — Same LAN (two devices, zero config)
 
 ### Prerequisites
 
-- **Python 3.10+** for the daemon
-- **Flutter SDK 3.0+** for the UI
-- **Go 1.21+** for the relay server (optional)
+- **Python 3.10+** — [python.org](https://python.org)
 
-### 1. Start the Python daemon
+### On each device
 
-```bash
-cd chitchat
-pip install -e .
-python core/daemon.py
+**Windows:**
+```batch
+run.bat
 ```
 
-The daemon starts mDNS discovery, opens TCP port 9877 for P2P, and listens on
-`ws://127.0.0.1:9876` for the Flutter UI.
+**macOS / Linux:**
+```bash
+chmod +x run.sh
+./run.sh
+```
 
-### 2. Run the Flutter app
+The first run auto-installs dependencies. Then open **http://localhost:9875** on each device.  
+Both devices will discover each other automatically via mDNS (Bonjour/Avahi).
+
+---
+
+### Sharing to another device
+
+Want to put ChitChat on a USB stick or send it to another computer?
+
+```bash
+python share.py          # creates chitchat-share.zip (~0.1 MB)
+```
+
+Copy the zip to the other device, extract, and run `python setup.py`.
+
+---
+
+## Usage Scenarios
+
+| Scenario | How |
+|---|---|
+| **Two PCs on same WiFi** | Run `python -m core.daemon` on both. Open browser → `localhost:9875`. Auto-discovery. |
+| **PC + Phone (same WiFi)** | Run daemon on PC. Phone opens `http://<PC-IP>:9875` in browser. Or build Flutter app for phone. |
+| **Two PCs on different networks** | Start relay server: `./server/relay-server.exe`. On each PC: `python -m core.daemon --relay ws://<RELAY_IP>:8080` |
+| **Headless server / Raspberry Pi** | `python -m core.daemon --bind 0.0.0.0` (Web UI accessible from LAN). No display needed. |
+
+### CLI Options
+
+```
+python -m core.daemon --help
+
+  --name, -n       Device name (default: hostname)
+  --p2p-port        P2P TCP port (default: 9877)
+  --http-port       Web UI HTTP port (default: 9875)
+  --ws-port         Flutter WebSocket port (default: 9876)
+  --bind             HTTP bind address (default: 0.0.0.0)
+  --relay            Relay server URL for cross-LAN
+  --debug            Verbose logging
+```
+
+### Flutter Desktop App (optional)
 
 ```bash
 cd app
 flutter pub get
-flutter run
+flutter run -d windows    # or macos, linux
+# Build release:
+flutter build windows
 ```
 
-### 3. (Optional) Run the relay server
+Pre-built Windows exe: `app/build/windows/x64/runner/Release/chitchat.exe`
+
+### Relay Server (optional, Go)
 
 ```bash
 cd server
-go run main.go
-# Or build a static binary:
-go build -ldflags="-s -w" -o chitchat-relay main.go
+go build -ldflags="-s -w" -o relay-server main.go  # ~8 MB
+./relay-server                                      # listens on :8080
 ```
 
-The relay listens on `:9878` and handles WebSocket connections from daemons that
-cannot reach each other directly.
+Docker:
+```bash
+cd server
+docker build -t chitchat-relay .
+docker run -p 8080:8080 chitchat-relay
+```
 
-## Development Phases
+## Development Status
 
 | Phase | Scope | Status |
 |---|---|---|
-| **MVP** | P2P text chat, mDNS discovery, Ed25519 identity, local SQLite storage | In progress |
-| **V1.0** | Rich media (images, files, voice), relay fallback, typed indicators + receipts | Planned |
-| **V1.5** | Group chats, message threads, contact favorites, search | Planned |
-| **V2.0** | Voice/video calls, bot API plugin system, relay federation, channels | Planned |
+| **Phase 1-2** | P2P text chat, mDNS discovery, Ed25519 identity, SQLite store, Web UI | Done |
+| **Phase 3** | Images, files, voice messages, link previews | Done |
+| **Phase 4** | Relay server, auto-failover, offline queue | Done |
+| **Phase 5** | Group chat, threads, @mentions, reactions | Done |
+| **Phase 6** | Keyboard shortcuts, PWA, notifications, accessibility | Done |
+| **V2.0** | Voice/video calls (WebRTC), bot/plugin API, Matrix bridge | Planned |
 
 ## Contributing
 

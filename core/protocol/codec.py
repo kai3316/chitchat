@@ -50,8 +50,10 @@ HEADER_SIZE = 7
 
 # Valid chat message types
 CHAT_MSG_TYPES = frozenset({
-    "chat_text", "chat_image", "chat_file", "typing", "read_receipt",
-    "reaction", "presence", "ack", "ping", "pong",
+    "chat_text", "chat_image", "chat_file", "chat_voice", "chat_link",
+    "typing", "read_receipt", "reaction", "presence", "ack", "ping", "pong",
+    "group_create", "group_message", "group_invite", "group_leave",
+    "reply", "mention", "link_preview",
 })
 
 # Valid message types for file transfer routing

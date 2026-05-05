@@ -40,3 +40,6 @@ htmlcov/
 *.pem
 device_id
 ~/.chitchat/
+
+# Share artifacts
+chitchat-share.zip

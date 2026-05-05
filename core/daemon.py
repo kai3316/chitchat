@@ -297,6 +297,23 @@ class ChitChatDaemon:
             "react": self._rpc_react,
             "get_status": self._rpc_get_status,
             "ping": self._rpc_ping,
+            # Groups
+            "create_group": self._rpc_create_group,
+            "get_groups": self._rpc_get_groups,
+            "add_group_member": self._rpc_add_group_member,
+            "remove_group_member": self._rpc_remove_group_member,
+            "send_group_message": self._rpc_send_group_message,
+            # Media
+            "send_image": self._rpc_send_image,
+            "send_file": self._rpc_send_file,
+            "send_voice": self._rpc_send_voice,
+            "fetch_link_preview": self._rpc_fetch_link_preview,
+            # Threads & reactions
+            "get_thread": self._rpc_get_thread,
+            "add_reaction": self._rpc_add_reaction,
+            "get_reactions": self._rpc_get_reactions,
+            # Relay
+            "get_relay_status": self._rpc_get_relay_status,
         }.get(method)
 
         if handler is None:
@@ -321,6 +338,7 @@ class ChitChatDaemon:
         self.store.save_message(StoredMessage(
             msg_id=msg_id, peer_id=peer_id, direction="sent",
             msg_type=msg_type, body=body, timestamp=ts,
+            reply_to=params.get("reply_to", ""),
         ))
         payload = {"msg_type": msg_type, "msg_id": msg_id, "body": body,
                     "timestamp": ts, "reply_to": params.get("reply_to", "")}
@@ -390,6 +408,160 @@ class ChitChatDaemon:
     async def _rpc_ping(self, params: dict) -> dict:
         return {"pong": True, "time": time.time()}
 
+    # ── Group RPCs ──────────────────────────────────────────────
+
+    async def _rpc_create_group(self, params: dict) -> dict:
+        name = params["name"]
+        members = params.get("member_ids", [])
+        group_id = uuid.uuid4().hex
+        info = self.store.create_group(group_id, name, members, self._device_id)
+        # Notify members via P2P or relay
+        for mid in members:
+            if mid in self.transport_mgr.get_connected_peers():
+                payload = {"msg_type": "group_invite", "group_id": group_id,
+                           "name": name, "members": members, "timestamp": time.time()}
+                data = encode_frame(payload, source_device=self._device_id)
+                self.transport_mgr.send_to_peer(mid, data)
+        return info.to_dict()
+
+    async def _rpc_get_groups(self, params: dict) -> dict:
+        groups = self.store.get_groups()
+        return {"groups": [g.to_dict() for g in groups]}
+
+    async def _rpc_add_group_member(self, params: dict) -> dict:
+        self.store.add_group_member(params["group_id"], params["device_id"])
+        return {"ok": True}
+
+    async def _rpc_remove_group_member(self, params: dict) -> dict:
+        self.store.remove_group_member(params["group_id"], params["device_id"])
+        return {"ok": True}
+
+    async def _rpc_send_group_message(self, params: dict) -> dict:
+        group_id = params["group_id"]
+        body = params.get("body", "")
+        msg_type = params.get("type", "chat_text")
+        msg_id = uuid.uuid4().hex
+        ts = time.time()
+
+        self.store.save_message(StoredMessage(
+            msg_id=msg_id, peer_id=group_id, direction="sent",
+            msg_type="group_message", body=body, timestamp=ts,
+            reply_to=params.get("reply_to", ""), is_group=True,
+        ))
+        group = self.store.get_group(group_id)
+        recipients = group.members if group else []
+        payload = {"msg_type": "group_message", "msg_id": msg_id, "body": body,
+                    "timestamp": ts, "group_id": group_id,
+                    "sender_id": self._device_id, "sender_name": self._device_name,
+                    "reply_to": params.get("reply_to", "")}
+        data = encode_frame(payload, msg_id=msg_id, source_device=self._device_name)
+        for mid in recipients:
+            if mid == self._device_id:
+                continue
+            if mid in self.transport_mgr.get_connected_peers():
+                self.transport_mgr.send_to_peer(mid, data)
+            elif self._relay_url and self.relay.is_connected:
+                self.relay.send(mid, data)
+        return {"msg_id": msg_id, "timestamp": ts, "recipients": len(recipients)}
+
+    # ── Media RPCs ──────────────────────────────────────────────
+
+    async def _rpc_send_image(self, params: dict) -> dict:
+        peer_id = params["peer_id"]
+        body = params.get("body", "")
+        file_name = params.get("file_name", "image.jpg")
+        msg_id = uuid.uuid4().hex
+        ts = time.time()
+        meta = json.dumps({"file_name": file_name, "data": body, "mime_type": "image/jpeg"})
+        self.store.save_message(StoredMessage(
+            msg_id=msg_id, peer_id=peer_id, direction="sent",
+            msg_type="chat_image", body=meta, timestamp=ts,
+        ))
+        payload = {"msg_type": "chat_image", "msg_id": msg_id,
+                    "body": body, "file_name": file_name, "timestamp": ts}
+        data = encode_frame(payload, msg_id=msg_id, source_device=self._device_name)
+        sent = self.transport_mgr.send_to_peer(peer_id, data)
+        return {"msg_id": msg_id, "timestamp": ts, "sent": sent}
+
+    async def _rpc_send_file(self, params: dict) -> dict:
+        peer_id = params["peer_id"]
+        body = params.get("body", "")
+        file_name = params.get("file_name", "file.bin")
+        file_size = params.get("file_size", 0)
+        msg_id = uuid.uuid4().hex
+        ts = time.time()
+        meta = json.dumps({"file_name": file_name, "file_size": file_size, "data": body})
+        self.store.save_message(StoredMessage(
+            msg_id=msg_id, peer_id=peer_id, direction="sent",
+            msg_type="chat_file", body=meta, timestamp=ts,
+        ))
+        payload = {"msg_type": "chat_file", "msg_id": msg_id,
+                    "body": body, "file_name": file_name,
+                    "file_size": file_size, "timestamp": ts}
+        data = encode_frame(payload, msg_id=msg_id, source_device=self._device_name)
+        sent = self.transport_mgr.send_to_peer(peer_id, data)
+        return {"msg_id": msg_id, "timestamp": ts, "sent": sent}
+
+    async def _rpc_send_voice(self, params: dict) -> dict:
+        peer_id = params["peer_id"]
+        body = params.get("body", "")
+        duration = params.get("duration", 0)
+        msg_id = uuid.uuid4().hex
+        ts = time.time()
+        meta = json.dumps({"duration": duration, "data": body})
+        self.store.save_message(StoredMessage(
+            msg_id=msg_id, peer_id=peer_id, direction="sent",
+            msg_type="chat_voice", body=meta, timestamp=ts,
+        ))
+        payload = {"msg_type": "chat_voice", "msg_id": msg_id,
+                    "body": body, "duration": duration, "timestamp": ts}
+        data = encode_frame(payload, msg_id=msg_id, source_device=self._device_name)
+        sent = self.transport_mgr.send_to_peer(peer_id, data)
+        return {"msg_id": msg_id, "timestamp": ts, "sent": sent}
+
+    async def _rpc_fetch_link_preview(self, params: dict) -> dict:
+        from core.media import fetch_link_preview
+        url = params.get("url", "")
+        if not url:
+            return {"error": "url required"}
+        preview = fetch_link_preview(url)
+        return {"preview": preview}
+
+    # ── Thread & reaction RPCs ──────────────────────────────────
+
+    async def _rpc_get_thread(self, params: dict) -> dict:
+        msgs = self.store.get_thread_messages(params["parent_msg_id"],
+                                              params.get("limit", 50))
+        return {"messages": [m.to_dict() for m in msgs]}
+
+    async def _rpc_add_reaction(self, params: dict) -> dict:
+        msg_id = params["msg_id"]
+        emoji = params.get("emoji", "👍")
+        self.store.add_reaction(msg_id, self._device_id, emoji)
+        # Broadcast to peer
+        peer_id = params.get("peer_id", "")
+        if peer_id and peer_id in self.transport_mgr.get_connected_peers():
+            payload = {"msg_type": "reaction", "msg_id": msg_id,
+                       "device_id": self._device_id, "emoji": emoji,
+                       "timestamp": time.time()}
+            data = encode_frame(payload, source_device=self._device_id)
+            self.transport_mgr.send_to_peer(peer_id, data)
+        return {"ok": True}
+
+    async def _rpc_get_reactions(self, params: dict) -> dict:
+        reactions = self.store.get_reactions(params["msg_id"])
+        return {"reactions": reactions}
+
+    # ── Relay RPC ───────────────────────────────────────────────
+
+    async def _rpc_get_relay_status(self, params: dict) -> dict:
+        return {
+            "relay_url": self._relay_url,
+            "relay_enabled": bool(self._relay_url),
+            "relay_connected": self.relay.is_connected,
+            "lan_peers": list(self.transport_mgr.get_connected_peers()),
+        }
+
     # ═══════════════════════════════════════════════════════════
     # Event broadcasting
     # ═══════════════════════════════════════════════════════════
@@ -424,6 +596,7 @@ class ChitChatDaemon:
             stored = StoredMessage(
                 msg_id=mid, peer_id=peer_id, direction="received",
                 msg_type="chat_text", body=raw.get("body", ""), timestamp=ts,
+                reply_to=raw.get("reply_to", ""),
             )
             self.store.save_message(stored)
             self._broadcast_sync("message_received", stored.to_dict())
@@ -455,14 +628,63 @@ class ChitChatDaemon:
             self._broadcast_sync("presence", {
                 "peer_id": peer_id, "status": raw.get("status", "online")})
 
-        elif msg_type in ("chat_image", "chat_file"):
+        elif msg_type in ("chat_image", "chat_file", "chat_voice", "chat_link"):
+            mid = raw.get("msg_id", uuid.uuid4().hex)
+            ts = raw.get("timestamp", time.time())
+            if msg_type == "chat_voice":
+                body = json.dumps({"duration": raw.get("duration", 0), "data": raw.get("body", "")})
+            elif msg_type == "chat_link":
+                try:
+                    preview = json.loads(raw.get("body", "{}"))
+                except (json.JSONDecodeError, TypeError):
+                    preview = {}
+                body = json.dumps({
+                    "url": preview.get("url", raw.get("url", "")),
+                    "title": preview.get("title", raw.get("title", "")),
+                    "description": preview.get("description", raw.get("description", "")),
+                    "thumbnail": preview.get("thumbnail", raw.get("thumbnail", "")),
+                    "domain": preview.get("domain", raw.get("domain", "")),
+                })
+            else:
+                body = json.dumps({"file_name": raw.get("file_name", ""), "data": raw.get("body", "")})
+            stored = StoredMessage(
+                msg_id=mid, peer_id=peer_id, direction="received",
+                msg_type=msg_type, body=body, timestamp=ts,
+            )
+            self.store.save_message(stored)
+            self._broadcast_sync("message_received", stored.to_dict())
+
+        elif msg_type == "group_message":
+            group_id = raw.get("group_id", "")
+            mid = raw.get("msg_id", uuid.uuid4().hex)
+            ts = raw.get("timestamp", time.time())
+            stored = StoredMessage(
+                msg_id=mid, peer_id=group_id, direction="received",
+                msg_type="group_message", body=raw.get("body", ""),
+                timestamp=ts, is_group=True,
+                reply_to=raw.get("reply_to", ""),
+            )
+            self.store.save_message(stored)
+            self._broadcast_sync("group_message_received", stored.to_dict())
+
+        elif msg_type == "reply":
             mid = raw.get("msg_id", uuid.uuid4().hex)
             ts = raw.get("timestamp", time.time())
             stored = StoredMessage(
                 msg_id=mid, peer_id=peer_id, direction="received",
-                msg_type=msg_type,
-                body=json.dumps({"file_name": raw.get("file_name", ""), "data": raw.get("body", "")}),
-                timestamp=ts,
+                msg_type="chat_text", body=raw.get("body", ""),
+                timestamp=ts, reply_to=raw.get("reply_to", ""),
+            )
+            self.store.save_message(stored)
+            self._broadcast_sync("message_received", stored.to_dict())
+
+        elif msg_type == "mention":
+            mid = raw.get("msg_id", uuid.uuid4().hex)
+            ts = raw.get("timestamp", time.time())
+            stored = StoredMessage(
+                msg_id=mid, peer_id=peer_id, direction="received",
+                msg_type="chat_text", body=raw.get("body", ""),
+                timestamp=ts, reply_to=raw.get("reply_to", ""),
             )
             self.store.save_message(stored)
             self._broadcast_sync("message_received", stored.to_dict())

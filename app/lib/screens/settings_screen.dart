@@ -49,7 +49,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('Device Name', style: theme.textTheme.labelMedium?.copyWith(color: theme.colorScheme.onSurfaceVariant)),
+                    Text(
+                      'Device Name',
+                      style: theme.textTheme.labelMedium?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
                     const SizedBox(height: 8),
                     TextField(
                       controller: _nameCtrl,
@@ -58,14 +63,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         isDense: true,
                         border: OutlineInputBorder(),
                       ),
-                      onSubmitted: (value) => settings.setDeviceName(value),
-                      onEditingComplete: () => settings.setDeviceName(_nameCtrl.text),
+                      onSubmitted: (value) =>
+                          settings.setDeviceName(value),
+                      onEditingComplete: () =>
+                          settings.setDeviceName(_nameCtrl.text),
                     ),
                     const SizedBox(height: 12),
                     SizedBox(
                       width: double.infinity,
                       child: FilledButton.tonal(
-                        onPressed: () => settings.setDeviceName(_nameCtrl.text),
+                        onPressed: () =>
+                            settings.setDeviceName(_nameCtrl.text),
                         child: const Text('Save Name'),
                       ),
                     ),
@@ -84,10 +92,75 @@ class _SettingsScreenState extends State<SettingsScreen> {
             child: Card(
               child: SwitchListTile(
                 title: const Text('Dark Theme'),
-                subtitle: Text(settings.isDarkMode ? 'Dark mode is on' : 'Light mode is on'),
-                secondary: Icon(settings.isDarkMode ? Icons.dark_mode : Icons.light_mode),
+                subtitle: Text(
+                  settings.isDarkMode ? 'Dark mode is on' : 'Light mode is on',
+                ),
+                secondary: Icon(
+                  settings.isDarkMode ? Icons.dark_mode : Icons.light_mode,
+                ),
                 value: settings.isDarkMode,
                 onChanged: (_) => settings.toggleTheme(),
+              ),
+            ),
+          ),
+
+          const SizedBox(height: 16),
+
+          // ── Notifications Section ───────────────────────
+          _sectionHeader('Notifications'),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Card(
+              child: SwitchListTile(
+                title: const Text('Notification Sounds'),
+                subtitle: Text(
+                  settings.notificationSound
+                      ? 'Sounds are enabled'
+                      : 'Sounds are muted',
+                ),
+                secondary: Icon(
+                  settings.notificationSound
+                      ? Icons.volume_up
+                      : Icons.volume_off,
+                ),
+                value: settings.notificationSound,
+                onChanged: (_) => settings.toggleNotificationSound(),
+              ),
+            ),
+          ),
+
+          const SizedBox(height: 16),
+
+          // ── Keyboard Shortcuts Section ──────────────────
+          _sectionHeader('Keyboard Shortcuts'),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Icon(Icons.keyboard, size: 20),
+                        const SizedBox(width: 8),
+                        Text(
+                          'Desktop Shortcuts',
+                          style: theme.textTheme.titleSmall,
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    _shortcutRow('Enter', 'Send message'),
+                    _shortcutRow('Shift + Enter', 'New line in message'),
+                    _shortcutRow('Long press message', 'Emoji reactions / Reply / Copy'),
+                    _shortcutRow('Swipe message', 'Reply to message'),
+                    _shortcutRow('Tap image', 'Full-screen viewer'),
+                    _shortcutRow('@', 'Mention member (group chats)'),
+                    _shortcutRow('Tap reply preview', 'Open thread view'),
+                  ],
+                ),
               ),
             ),
           ),
@@ -108,25 +181,38 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       children: [
                         const Icon(Icons.dns_outlined, size: 20),
                         const SizedBox(width: 8),
-                        Text('Daemon WebSocket', style: theme.textTheme.titleSmall),
+                        Text(
+                          'Daemon WebSocket',
+                          style: theme.textTheme.titleSmall,
+                        ),
                       ],
                     ),
                     const SizedBox(height: 8),
                     Container(
                       width: double.infinity,
-                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 10,
+                      ),
                       decoration: BoxDecoration(
                         color: theme.colorScheme.surfaceContainerHighest,
                         borderRadius: BorderRadius.circular(8),
                       ),
                       child: const Row(
                         children: [
-                          Icon(Icons.link, size: 16, color: Colors.greenAccent),
+                          Icon(
+                            Icons.link,
+                            size: 16,
+                            color: Colors.greenAccent,
+                          ),
                           SizedBox(width: 8),
                           Expanded(
                             child: Text(
                               'ws://127.0.0.1:9876',
-                              style: TextStyle(fontFamily: 'monospace', fontSize: 14),
+                              style: TextStyle(
+                                fontFamily: 'monospace',
+                                fontSize: 14,
+                              ),
                             ),
                           ),
                         ],
@@ -152,13 +238,27 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   children: [
                     Row(
                       children: [
-                        Icon(Icons.chat_bubble_rounded, color: theme.colorScheme.primary, size: 28),
+                        Icon(
+                          Icons.chat_bubble_rounded,
+                          color: theme.colorScheme.primary,
+                          size: 28,
+                        ),
                         const SizedBox(width: 12),
                         Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            Text('ChitChat', style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold)),
-                            Text('P2P Chat Application', style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.onSurfaceVariant)),
+                            Text(
+                              'ChitChat',
+                              style: theme.textTheme.titleMedium?.copyWith(
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            Text(
+                              'P2P Chat Application',
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
                           ],
                         ),
                       ],
@@ -202,9 +302,61 @@ class _SettingsScreenState extends State<SettingsScreen> {
         children: [
           SizedBox(
             width: 80,
-            child: Text(label, style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant)),
+            child: Text(
+              label,
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+            ),
           ),
-          Expanded(child: Text(value, style: Theme.of(context).textTheme.bodyMedium)),
+          Expanded(
+            child: Text(value, style: Theme.of(context).textTheme.bodyMedium),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _shortcutRow(String keys, String description) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 5),
+      child: Row(
+        children: [
+          Container(
+            padding:
+                const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+            decoration: BoxDecoration(
+              color: Theme.of(context)
+                  .colorScheme
+                  .primaryContainer
+                  .withOpacity(0.3),
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(
+                color: Theme.of(context)
+                    .colorScheme
+                    .primary
+                    .withOpacity(0.3),
+              ),
+            ),
+            child: Text(
+              keys,
+              style: TextStyle(
+                fontSize: 12,
+                fontFamily: 'monospace',
+                fontWeight: FontWeight.w600,
+                color: Theme.of(context).colorScheme.primary,
+              ),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              description,
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    fontSize: 13,
+                  ),
+            ),
+          ),
         ],
       ),
     );
