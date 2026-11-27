@@ -1,0 +1,5 @@
+# Keep the build context small: the compiled relay binary is 9 MB and the
+# Dockerfile rebuilds from source anyway.
+relay-server
+relay-server.exe
+*.md
