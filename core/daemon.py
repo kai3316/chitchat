@@ -206,7 +206,7 @@ class ChitChatDaemon:
             "httpPort": self._http_port,
             "deviceId": self._device_id,
             "deviceName": self._device_name,
-            "version": "1.0.0",
+            "version": "1.1.0",
         }
 
     def _render_web_ui(self) -> str:
@@ -953,7 +953,7 @@ def main():
 
     lines = [
         rule,
-        "|" + "ChitChat v1.0.0".center(WIDTH) + "|",
+        "|" + "ChitChat v1.1.0".center(WIDTH) + "|",
         rule,
         _row(f"Device:     {daemon.device_name}"),
         _row(f"P2P:        tcp://0.0.0.0:{daemon._p2p_port}"),
