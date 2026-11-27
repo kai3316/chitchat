@@ -18,21 +18,51 @@ from zeroconf import ServiceBrowser, ServiceInfo, Zeroconf
 logger = logging.getLogger(__name__)
 
 
+def _primary_outbound_ip():
+    """Return the IPv4 address the OS would use to reach the internet.
+
+    Works on macOS, Linux and Windows without shelling out.  This is the
+    address that must be advertised over mDNS: on macOS ``gethostname()``
+    often resolves to nothing (or to loopback), which used to leave the
+    daemon advertising 127.0.0.1 and invisible to every other device.
+    """
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("8.8.8.8", 80))
+            ip = probe.getsockname()[0]
+        finally:
+            probe.close()
+        if ip and not ip.startswith("127.") and not ip.startswith("169.254."):
+            return ip
+    except OSError:
+        pass
+    return ""
+
+
 def _get_all_local_addresses():
     addresses = []
     seen = set()
+
+    def _add(ip: str):
+        if not ip or ip.startswith("127.") or ip.startswith("169.254."):
+            return
+        if ip not in seen:
+            seen.add(ip)
+            addresses.append(ip)
+
+    # The routing table is the most reliable source on every platform.
+    _add(_primary_outbound_ip())
+
     try:
         for info in socket.getaddrinfo(
             socket.gethostname(), None, family=socket.AF_INET
         ):
-            ip = info[4][0]
-            if ip.startswith("127.") or ip.startswith("169.254."):
-                continue
-            if ip not in seen:
-                seen.add(ip)
-                addresses.append(ip)
+            _add(info[4][0])
     except Exception:
-        logger.warning("Failed to enumerate local addresses")
+        if not addresses:
+            logger.warning("Failed to enumerate local addresses")
+
     return addresses
 
 
@@ -68,31 +98,79 @@ def _get_interface_priorities():
                     priorities[ip] = 2
                 else:
                     priorities[ip] = 3
+        elif system == "Linux":
+            # ``ip`` ships with iproute2 on every modern distribution;
+            # ``ifconfig`` (net-tools) is no longer installed by default.
+            priorities.update(_linux_ip_priorities())
+            if not priorities:
+                priorities.update(_ifconfig_priorities())
         else:
-            result = subprocess.run(
-                ["ifconfig"], capture_output=True, text=True, timeout=5
-            )
-            iface = ""
-            for line in result.stdout.splitlines():
-                if line and line[0] not in ("\t", " "):
-                    iface = line.split(":")[0].split()[0].lower()
-                elif "inet " in line and iface:
-                    parts = line.strip().split()
-                    try:
-                        idx = parts.index("inet")
-                        ip = parts[idx + 1]
-                        if any(k in iface for k in ("eth", "en")):
-                            priorities[ip] = 0
-                        elif any(k in iface for k in ("wlan", "wl", "wi-fi")):
-                            priorities[ip] = 1
-                        elif any(k in iface for k in ("tun", "tap", "vpn", "ppp", "utun")):
-                            priorities[ip] = 2
-                        else:
-                            priorities[ip] = 3
-                    except (ValueError, IndexError):
-                        pass
+            priorities.update(_ifconfig_priorities())
     except Exception:
         pass
+    return priorities
+
+
+def _priority_for_iface(iface: str) -> int:
+    if any(k in iface for k in ("eth", "en")):
+        return 0
+    if any(k in iface for k in ("wlan", "wl", "wi-fi")):
+        return 1
+    if any(k in iface for k in ("tun", "tap", "vpn", "ppp", "utun")):
+        return 2
+    return 3
+
+
+def _linux_ip_priorities():
+    """Map addresses to interfaces using ``ip -o -4 addr``."""
+    priorities = {}
+    try:
+        result = subprocess.run(
+            ["ip", "-o", "-4", "addr", "show"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return priorities
+    except (OSError, subprocess.SubprocessError):
+        return priorities
+
+    # Format: "2: eth0    inet 192.168.1.5/24 brd ... scope global eth0"
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if "inet" not in parts:
+            continue
+        try:
+            iface = parts[1].rstrip(":").lower()
+            cidr = parts[parts.index("inet") + 1]
+            ip = cidr.split("/")[0]
+        except (IndexError, ValueError):
+            continue
+        if ip:
+            priorities[ip] = _priority_for_iface(iface)
+    return priorities
+
+
+def _ifconfig_priorities():
+    """Fallback for macOS and older Linux systems."""
+    priorities = {}
+    try:
+        result = subprocess.run(
+            ["ifconfig"], capture_output=True, text=True, timeout=5
+        )
+    except (OSError, subprocess.SubprocessError):
+        return priorities
+    iface = ""
+    for line in result.stdout.splitlines():
+        if line and line[0] not in ("\t", " "):
+            iface = line.split(":")[0].split()[0].lower()
+        elif "inet " in line and iface:
+            parts = line.strip().split()
+            try:
+                idx = parts.index("inet")
+                ip = parts[idx + 1]
+            except (ValueError, IndexError):
+                continue
+            priorities[ip] = _priority_for_iface(iface)
     return priorities
 
 
@@ -105,6 +183,10 @@ def _get_local_address():
         )
         return "127.0.0.1"
     priorities = _get_interface_priorities()
+    # The interface holding the default route is the one peers can reach.
+    outbound = _primary_outbound_ip()
+    if outbound:
+        priorities[outbound] = -1
     sorted_ips = sorted(all_ips, key=lambda ip: priorities.get(ip, 99))
     best = sorted_ips[0]
     logger.info("Local IPs: %s (selected %s)", all_ips, best)

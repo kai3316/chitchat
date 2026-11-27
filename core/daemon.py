@@ -22,6 +22,13 @@ import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
+# Allow ``python core/daemon.py`` as well as ``python -m core.daemon``:
+# direct execution puts core/ on sys.path, where ``import core.*`` fails.
+if __package__ in (None, ""):
+    _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _ROOT not in sys.path:
+        sys.path.insert(0, _ROOT)
+
 import websockets
 from websockets.asyncio.server import serve as ws_serve
 
@@ -31,7 +38,8 @@ from core.transport.discovery import Discovery
 from core.security.pairing import PairingManager
 from core.security.encryption import EncryptionManager
 from core.store.db import MessageStore, StoredMessage
-from core.config import load_config, save_config, CONFIG_DIR as DATA_DIR
+from core import config as config_mod
+from core.config import load_config, save_config  # noqa: F401  (public API)
 
 logger = logging.getLogger(__name__)
 
@@ -56,18 +64,22 @@ class ChitChatDaemon:
 
     def __init__(self, device_name: str = "", p2p_port: int = DEFAULT_P2P_PORT,
                  ws_port: int = DEFAULT_WS_PORT, http_port: int = DEFAULT_HTTP_PORT,
-                 bind_http: str = "0.0.0.0", relay_url: str = ""):
-        os.makedirs(DATA_DIR, exist_ok=True)
+                 bind_http: str = "0.0.0.0", relay_url: str = "",
+                 bind_ws: str = "0.0.0.0"):
+        os.makedirs(config_mod.get_data_dir(), exist_ok=True)
 
         self._device_name = device_name or f"ChitChat-{secrets.token_hex(2)}"
         self._p2p_port = p2p_port
         self._ws_port = ws_port
         self._http_port = http_port
         self._bind_http = bind_http
+        self._bind_ws = bind_ws or bind_http
         self._relay_url = relay_url
         self._running = False
         self._ws_clients: set = set()
         self._loop = None
+        self._known_peer_names: dict[str, str] = {}
+        self._online_peers: set[str] = set()
 
         # ── Identity & Security ───────────────────────────────
         self.pairing_mgr = PairingManager(
@@ -89,7 +101,8 @@ class ChitChatDaemon:
         self.enc_mgr = EncryptionManager(identity.fingerprint)
 
         # ── Storage ────────────────────────────────────────────
-        self.store = MessageStore(os.path.join(DATA_DIR, "chitchat.db"))
+        self.store = MessageStore(
+            os.path.join(config_mod.get_data_dir(), "chitchat.db"))
 
         # ── Transport ──────────────────────────────────────────
         self.transport_mgr = TransportManager(
@@ -100,6 +113,7 @@ class ChitChatDaemon:
         self.transport_mgr.set_on_peer_message(self._on_peer_message)
         self.transport_mgr.set_on_wake(self._on_wake)
         self.transport_mgr.set_on_security_alert(self._on_security_alert)
+        self.transport_mgr.set_on_peer_connected(self._on_peer_connected)
 
         # ── Relay ──────────────────────────────────────────────
         from core.relay.client import RelayClient
@@ -123,25 +137,30 @@ class ChitChatDaemon:
     # ═══════════════════════════════════════════════════════════
 
     def _load_or_create_device_id(self) -> str:
-        path = os.path.join(DATA_DIR, "device_id")
+        path = os.path.join(config_mod.get_data_dir(), "device_id")
         if os.path.exists(path):
-            return open(path).read().strip()
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read().strip()
         did = uuid.uuid4().hex
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write(did)
         return did
 
     def _load_key(self, filename: str) -> str:
-        path = os.path.join(DATA_DIR, filename)
+        path = os.path.join(config_mod.get_data_dir(), filename)
         if os.path.exists(path):
-            return open(path).read()
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
         return ""
 
     def _save_key(self, filename: str, data: str) -> None:
-        path = os.path.join(DATA_DIR, filename)
-        with open(path, "w") as f:
+        path = os.path.join(config_mod.get_data_dir(), filename)
+        with open(path, "w", encoding="utf-8") as f:
             f.write(data)
-        os.chmod(path, 0o600)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
 
     # ═══════════════════════════════════════════════════════════
     # Lifecycle
@@ -179,20 +198,49 @@ class ChitChatDaemon:
     # HTTP server (serves embedded web UI)
     # ═══════════════════════════════════════════════════════════
 
+    def bootstrap_config(self) -> dict:
+        """Runtime settings the web UI needs to reach this daemon."""
+        return {
+            "wsPort": self._ws_port,
+            "wsPath": "/",
+            "httpPort": self._http_port,
+            "deviceId": self._device_id,
+            "deviceName": self._device_name,
+            "version": "1.0.0",
+        }
+
+    def _render_web_ui(self) -> str:
+        """Return the embedded UI with the live WebSocket port injected.
+
+        The page used to hardcode port 9876, so any ``--ws-port`` change
+        (or a second instance) left the UI stuck on "disconnected".
+        """
+        bootstrap = json.dumps(self.bootstrap_config())
+        snippet = (
+            "<script>window.CHITCHAT_CONFIG = Object.assign("
+            f"{bootstrap}, window.CHITCHAT_CONFIG || {{}});</script>"
+        )
+        if "</head>" in WEB_UI_HTML:
+            return WEB_UI_HTML.replace("</head>", snippet + "</head>", 1)
+        return snippet + WEB_UI_HTML
+
     def _create_http_server(self) -> HTTPServer:
         daemon = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
-                if self.path == "/" or self.path == "/index.html":
-                    self._send_html(WEB_UI_HTML)
+                if self.path == "/" or self.path.startswith("/index.html"):
+                    self._send_html(daemon._render_web_ui())
                 elif self.path == "/health":
                     self._send_json({
                         "status": "ok",
                         "device": daemon._device_name,
+                        "device_id": daemon._device_id,
                         "peers": len(daemon.transport_mgr.get_connected_peers()),
                         "time": time.time(),
                     })
+                elif self.path == "/config":
+                    self._send_json(daemon.bootstrap_config())
                 else:
                     self.send_response(404)
                     self.end_headers()
@@ -241,6 +289,7 @@ class ChitChatDaemon:
 
     def _sync_send_message(self, peer_id: str, text: str) -> None:
         """Synchronous wrapper for sending messages (called from HTTP thread)."""
+        peer_id = self.transport_mgr.resolve_peer_id(peer_id)
         msg_id = uuid.uuid4().hex
         ts = time.time()
         stored = StoredMessage(
@@ -248,17 +297,17 @@ class ChitChatDaemon:
             msg_type="chat_text", body=text, timestamp=ts,
         )
         self.store.save_message(stored)
-        payload = {"msg_type": "chat_text", "msg_id": msg_id, "body": text, "timestamp": ts}
-        data = encode_frame(payload, msg_id=msg_id, source_device=self._device_name)
-        self.transport_mgr.send_to_peer(peer_id, data)
+        payload = {"msg_type": "chat_text", "msg_id": msg_id, "body": text,
+                   "timestamp": ts, "sender_name": self._device_name}
+        self._send_frame(peer_id, payload, msg_id)
 
     # ═══════════════════════════════════════════════════════════
     # WebSocket server
     # ═══════════════════════════════════════════════════════════
 
     async def run_ws_server(self) -> None:
-        logger.info("WebSocket server on ws://127.0.0.1:%d", self._ws_port)
-        async with ws_serve(self._handle_ws, "127.0.0.1", self._ws_port):
+        logger.info("WebSocket server on ws://%s:%d", self._bind_ws, self._ws_port)
+        async with ws_serve(self._handle_ws, self._bind_ws, self._ws_port):
             await asyncio.Future()
 
     async def _handle_ws(self, ws):
@@ -329,7 +378,7 @@ class ChitChatDaemon:
     # ═══════════════════════════════════════════════════════════
 
     async def _rpc_send_message(self, params: dict) -> dict:
-        peer_id = params["peer_id"]
+        peer_id = self.transport_mgr.resolve_peer_id(params["peer_id"])
         msg_type = params.get("type", "chat_text")
         body = params.get("body", "")
         msg_id = uuid.uuid4().hex
@@ -341,15 +390,17 @@ class ChitChatDaemon:
             reply_to=params.get("reply_to", ""),
         ))
         payload = {"msg_type": msg_type, "msg_id": msg_id, "body": body,
-                    "timestamp": ts, "reply_to": params.get("reply_to", "")}
-        data = encode_frame(payload, msg_id=msg_id, source_device=self._device_name)
+                    "timestamp": ts, "reply_to": params.get("reply_to", ""),
+                    "sender_name": self._device_name}
+        data = encode_frame(payload, msg_id=msg_id, source_device=self._device_id)
         sent = self.transport_mgr.send_to_peer(peer_id, data)
         if sent:
             self.store.mark_delivered(msg_id)
-        return {"msg_id": msg_id, "timestamp": ts, "sent": sent}
+        return {"msg_id": msg_id, "timestamp": ts, "sent": bool(sent),
+                "peer_id": peer_id}
 
     async def _rpc_get_history(self, params: dict) -> dict:
-        peer_id = params["peer_id"]
+        peer_id = self.transport_mgr.resolve_peer_id(params["peer_id"])
         before = params.get("before", "")
         limit = min(params.get("limit", 50), 200)
         msgs = self.store.get_history(peer_id, before, limit)
@@ -359,42 +410,48 @@ class ChitChatDaemon:
         contacts = self.store.get_contacts()
         online_ids = set(self.transport_mgr.get_connected_peers())
         result = []
+        seen = set()
         for c in contacts:
             d = c.to_dict()
             d["online"] = c.device_id in online_ids
             result.append(d)
-        known_ids = {c.device_id for c in contacts}
+            seen.add(c.device_id)
+        # Connected peers that have no stored contact yet (e.g. first
+        # contact is inbound). Deduplicate by the real device_id.
         for pid, name in self.transport_mgr.get_connected_peers_with_names():
-            if pid not in known_ids:
-                result.append({
-                    "device_id": pid, "device_name": name or pid[:8],
-                    "paired": True, "last_message": "", "last_time": 0.0,
-                    "unread_count": 0, "online": True,
-                })
+            if pid in seen:
+                continue
+            seen.add(pid)
+            result.append({
+                "device_id": pid,
+                "device_name": name or self._known_peer_names.get(pid, pid[:8]),
+                "paired": True, "last_message": "", "last_time": 0.0,
+                "unread_count": 0, "online": True, "is_group": False,
+                "member_count": 0,
+            })
         return {"contacts": result}
 
     async def _rpc_mark_read(self, params: dict) -> dict:
-        peer_id = params["peer_id"]
+        peer_id = self.transport_mgr.resolve_peer_id(params["peer_id"])
         self.store.mark_all_read(peer_id)
-        if peer_id in self.transport_mgr.get_connected_peers():
+        if self.transport_mgr.is_connected(peer_id):
             payload = {"msg_type": "read_receipt", "timestamp": time.time()}
-            data = encode_frame(payload, source_device=self._device_name)
+            data = encode_frame(payload, source_device=self._device_id)
             self.transport_mgr.send_to_peer(peer_id, data)
         return {"ok": True}
 
     async def _rpc_send_typing(self, params: dict) -> dict:
-        peer_id = params["peer_id"]
+        peer_id = self.transport_mgr.resolve_peer_id(params["peer_id"])
         payload = {"msg_type": "typing", "timestamp": time.time()}
-        data = encode_frame(payload, source_device=self._device_name)
-        self.transport_mgr.send_to_peer(peer_id, data)
-        return {"ok": True}
+        data = encode_frame(payload, source_device=self._device_id)
+        return {"ok": bool(self.transport_mgr.send_to_peer(peer_id, data))}
 
     async def _rpc_react(self, params: dict) -> dict:
+        peer_id = self.transport_mgr.resolve_peer_id(params["peer_id"])
         payload = {"msg_type": "reaction", "msg_id": params["msg_id"],
                     "emoji": params.get("emoji", "👍"), "timestamp": time.time()}
-        data = encode_frame(payload, source_device=self._device_name)
-        self.transport_mgr.send_to_peer(params["peer_id"], data)
-        return {"ok": True}
+        data = encode_frame(payload, source_device=self._device_id)
+        return {"ok": bool(self.transport_mgr.send_to_peer(peer_id, data))}
 
     async def _rpc_get_status(self, params: dict) -> dict:
         return {
@@ -454,20 +511,28 @@ class ChitChatDaemon:
                     "timestamp": ts, "group_id": group_id,
                     "sender_id": self._device_id, "sender_name": self._device_name,
                     "reply_to": params.get("reply_to", "")}
-        data = encode_frame(payload, msg_id=msg_id, source_device=self._device_name)
+        data = encode_frame(payload, msg_id=msg_id, source_device=self._device_id)
+        delivered = 0
         for mid in recipients:
             if mid == self._device_id:
                 continue
-            if mid in self.transport_mgr.get_connected_peers():
-                self.transport_mgr.send_to_peer(mid, data)
+            if self.transport_mgr.send_to_peer(mid, data):
+                delivered += 1
             elif self._relay_url and self.relay.is_connected:
                 self.relay.send(mid, data)
-        return {"msg_id": msg_id, "timestamp": ts, "recipients": len(recipients)}
+                delivered += 1
+        return {"msg_id": msg_id, "timestamp": ts, "recipients": len(recipients),
+                "delivered": delivered}
 
     # ── Media RPCs ──────────────────────────────────────────────
 
+    def _send_frame(self, peer_id: str, payload: dict, msg_id: str = "") -> bool:
+        """Encode and send one frame to a peer, returning delivery success."""
+        data = encode_frame(payload, msg_id=msg_id, source_device=self._device_id)
+        return bool(self.transport_mgr.send_to_peer(peer_id, data))
+
     async def _rpc_send_image(self, params: dict) -> dict:
-        peer_id = params["peer_id"]
+        peer_id = self.transport_mgr.resolve_peer_id(params["peer_id"])
         body = params.get("body", "")
         file_name = params.get("file_name", "image.jpg")
         msg_id = uuid.uuid4().hex
@@ -479,12 +544,11 @@ class ChitChatDaemon:
         ))
         payload = {"msg_type": "chat_image", "msg_id": msg_id,
                     "body": body, "file_name": file_name, "timestamp": ts}
-        data = encode_frame(payload, msg_id=msg_id, source_device=self._device_name)
-        sent = self.transport_mgr.send_to_peer(peer_id, data)
+        sent = self._send_frame(peer_id, payload, msg_id)
         return {"msg_id": msg_id, "timestamp": ts, "sent": sent}
 
     async def _rpc_send_file(self, params: dict) -> dict:
-        peer_id = params["peer_id"]
+        peer_id = self.transport_mgr.resolve_peer_id(params["peer_id"])
         body = params.get("body", "")
         file_name = params.get("file_name", "file.bin")
         file_size = params.get("file_size", 0)
@@ -498,12 +562,11 @@ class ChitChatDaemon:
         payload = {"msg_type": "chat_file", "msg_id": msg_id,
                     "body": body, "file_name": file_name,
                     "file_size": file_size, "timestamp": ts}
-        data = encode_frame(payload, msg_id=msg_id, source_device=self._device_name)
-        sent = self.transport_mgr.send_to_peer(peer_id, data)
+        sent = self._send_frame(peer_id, payload, msg_id)
         return {"msg_id": msg_id, "timestamp": ts, "sent": sent}
 
     async def _rpc_send_voice(self, params: dict) -> dict:
-        peer_id = params["peer_id"]
+        peer_id = self.transport_mgr.resolve_peer_id(params["peer_id"])
         body = params.get("body", "")
         duration = params.get("duration", 0)
         msg_id = uuid.uuid4().hex
@@ -515,8 +578,7 @@ class ChitChatDaemon:
         ))
         payload = {"msg_type": "chat_voice", "msg_id": msg_id,
                     "body": body, "duration": duration, "timestamp": ts}
-        data = encode_frame(payload, msg_id=msg_id, source_device=self._device_name)
-        sent = self.transport_mgr.send_to_peer(peer_id, data)
+        sent = self._send_frame(peer_id, payload, msg_id)
         return {"msg_id": msg_id, "timestamp": ts, "sent": sent}
 
     async def _rpc_fetch_link_preview(self, params: dict) -> dict:
@@ -539,13 +601,12 @@ class ChitChatDaemon:
         emoji = params.get("emoji", "👍")
         self.store.add_reaction(msg_id, self._device_id, emoji)
         # Broadcast to peer
-        peer_id = params.get("peer_id", "")
-        if peer_id and peer_id in self.transport_mgr.get_connected_peers():
+        peer_id = self.transport_mgr.resolve_peer_id(params.get("peer_id", ""))
+        if peer_id and self.transport_mgr.is_connected(peer_id):
             payload = {"msg_type": "reaction", "msg_id": msg_id,
                        "device_id": self._device_id, "emoji": emoji,
                        "timestamp": time.time()}
-            data = encode_frame(payload, source_device=self._device_id)
-            self.transport_mgr.send_to_peer(peer_id, data)
+            self._send_frame(peer_id, payload)
         return {"ok": True}
 
     async def _rpc_get_reactions(self, params: dict) -> dict:
@@ -588,7 +649,16 @@ class ChitChatDaemon:
     def _on_peer_message(self, msg) -> None:
         msg_type = getattr(msg, "msg_type", "") or "chat_text"
         raw = getattr(msg, "_raw_payload", {})
-        peer_id = getattr(msg, "source_device", "")
+        # ``source_device`` is stamped with the TLS-authenticated device_id
+        # by PeerConnection, so conversations are keyed by identity instead
+        # of by the sender's display name.
+        peer_id = getattr(msg, "source_device", "") or ""
+        peer_name = getattr(msg, "source_name", "") or ""
+        if not peer_id:
+            logger.warning("dropping %s message without an authenticated sender", msg_type)
+            return
+        if peer_name:
+            self._remember_peer_name(peer_id, peer_name)
 
         if msg_type == "chat_text":
             mid = raw.get("msg_id", uuid.uuid4().hex)
@@ -612,8 +682,9 @@ class ChitChatDaemon:
             self._broadcast_sync("read_receipt", {"peer_id": peer_id})
 
         elif msg_type == "reaction":
-            self._broadcast_sync("reaction", {
+            self._broadcast_sync("reaction_added", {
                 "peer_id": peer_id,
+                "sender_id": peer_id,
                 "msg_id": raw.get("msg_id", ""),
                 "emoji": raw.get("emoji", "👍"),
             })
@@ -654,10 +725,29 @@ class ChitChatDaemon:
             self.store.save_message(stored)
             self._broadcast_sync("message_received", stored.to_dict())
 
+        elif msg_type == "group_invite":
+            group_id = raw.get("group_id", "")
+            if group_id:
+                members = raw.get("members") or []
+                if peer_id and peer_id not in members:
+                    members.append(peer_id)
+                if self._device_id not in members:
+                    members.append(self._device_id)
+                self.store.ensure_group(
+                    group_id, raw.get("name") or "Group", members, peer_id)
+                self._broadcast_sync("contact_updated", {"peer_id": group_id})
+
         elif msg_type == "group_message":
             group_id = raw.get("group_id", "")
+            if not group_id:
+                return
             mid = raw.get("msg_id", uuid.uuid4().hex)
             ts = raw.get("timestamp", time.time())
+            # A message can arrive before the invite; show it instead of
+            # dropping it into a group that does not exist locally.
+            self.store.ensure_group(
+                group_id, raw.get("group_name") or "Group",
+                [peer_id, self._device_id], peer_id)
             stored = StoredMessage(
                 msg_id=mid, peer_id=group_id, direction="received",
                 msg_type="group_message", body=raw.get("body", ""),
@@ -689,19 +779,53 @@ class ChitChatDaemon:
             self.store.save_message(stored)
             self._broadcast_sync("message_received", stored.to_dict())
 
+    def _remember_peer_name(self, device_id: str, device_name: str) -> None:
+        """Persist a peer's display name once per change.
+
+        Called on every inbound frame, so it must not touch the database
+        unless the name actually changed.
+        """
+        if not device_id or not device_name:
+            return
+        if self._known_peer_names.get(device_id) == device_name:
+            return
+        self._known_peer_names[device_id] = device_name
+        self.store.upsert_contact(device_id, device_name, paired=True)
+
+    def _on_peer_connected(self, device_id: str, device_name: str) -> None:
+        """A peer finished the TLS handshake and is now reachable."""
+        real_name = device_name or self._known_peer_names.get(device_id, device_id[:8])
+        self._online_peers.add(device_id)
+        self._remember_peer_name(device_id, real_name)
+        aliases = [h for h, r in self.transport_mgr.get_resolved_hashes().items()
+                   if r == device_id]
+        if real_name and real_name != device_id:
+            aliases.append(real_name)
+        adopted = self.store.adopt_contact_aliases(device_id, aliases)
+        if adopted:
+            logger.info("Merged %d temporary contact id(s) into %s",
+                        len(adopted), device_id[:12])
+        self._broadcast_sync("peer_online", {
+            "peer_id": device_id, "device_name": real_name})
+
     # ═══════════════════════════════════════════════════════════
     # Discovery callbacks
     # ═══════════════════════════════════════════════════════════
 
     def _on_peer_found(self, device_id: str, device_name: str, address: str, port: int) -> None:
         logger.info("Peer found: %s (%s) @ %s:%d", device_name, device_id[:12], address, port)
+        # ``device_id`` here is the hashed mDNS id, not the real identity.
+        # Never store a contact for it: the real device_id arrives with the
+        # TLS handshake and _on_peer_connected persists that one. Doing
+        # both produced a phantom duplicate contact per peer.
         self.transport_mgr.connect_to_peer(device_id, device_name, address, port)
-        self.store.upsert_contact(device_id, device_name, paired=False)
 
     def _on_peer_lost(self, device_id: str) -> None:
         logger.info("Peer lost: %s", device_id[:12])
+        real_id = self.transport_mgr.resolve_peer_id(device_id)
+        self._online_peers.discard(real_id)
         self.transport_mgr.disconnect_peer(device_id)
-        self._broadcast_sync("peer_offline", {"peer_id": device_id})
+        self._broadcast_sync("peer_offline", {"peer_id": real_id})
 
     def _on_wake(self) -> None:
         self.discovery._wake_recovery()
@@ -731,18 +855,36 @@ class ChitChatDaemon:
 # ═══════════════════════════════════════════════════════════════
 
 def main():
+    # Windows consoles still default to a legacy code page. Log messages
+    # contain characters outside it, and writing one used to abort the
+    # daemon with UnicodeEncodeError when stdout was redirected.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
     parser = argparse.ArgumentParser(description="ChitChat daemon")
     parser.add_argument("--name", "-n", default="", help="Device display name")
     parser.add_argument("--p2p-port", type=int, default=0, help="P2P TCP port")
     parser.add_argument("--ws-port", type=int, default=0, help="WebSocket port")
     parser.add_argument("--http-port", type=int, default=0, help="HTTP server port")
     parser.add_argument("--bind", default="", help="HTTP bind address (0.0.0.0 for LAN access)")
+    parser.add_argument("--ws-bind", default="", help="WebSocket bind address (defaults to --bind)")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--relay", default="", help="Relay server URL (e.g. ws://relay.example.com:8080)")
     parser.add_argument("--config", default="", help="Path to config file")
+    parser.add_argument("--data-dir", default="",
+                        help="Directory for identity, database and config "
+                             "(default: $CHITCHAT_HOME or ~/.chitchat)")
     args = parser.parse_args()
 
-    cfg = load_config()
+    # The data directory must be resolved before the config file is read,
+    # because config.json lives inside it.
+    from core import config as config_mod
+
+    data_dir = config_mod.configure(args.data_dir)
+    cfg = config_mod.load_config(args.config)
 
     # CLI args override config
     device_name = args.name or cfg.get("device_name", "")
@@ -750,6 +892,7 @@ def main():
     ws_port = args.ws_port or cfg.get("ws_port", DEFAULT_WS_PORT)
     http_port = args.http_port or cfg.get("http_port", DEFAULT_HTTP_PORT)
     bind_http = args.bind or cfg.get("http_bind", "0.0.0.0")
+    bind_ws = args.ws_bind or cfg.get("ws_bind", "") or bind_http
     debug = args.debug or cfg.get("debug", False)
     relay_url = args.relay or cfg.get("relay_url", "")
 
@@ -763,6 +906,8 @@ def main():
     for lib in ("zeroconf", "websockets", "asyncio"):
         logging.getLogger(lib).setLevel(logging.WARNING)
 
+    logger.info("Data directory: %s", data_dir)
+
     daemon = ChitChatDaemon(
         device_name=device_name,
         p2p_port=p2p_port,
@@ -770,6 +915,7 @@ def main():
         http_port=http_port,
         bind_http=bind_http,
         relay_url=relay_url,
+        bind_ws=bind_ws,
     )
     try:
         daemon.start()
@@ -778,7 +924,12 @@ def main():
         sys.exit(1)
 
     # Start HTTP server in a thread
-    httpd = daemon._create_http_server()
+    try:
+        httpd = daemon._create_http_server()
+    except OSError as e:
+        logger.error("Cannot listen on HTTP port %d: %s", http_port, e)
+        daemon.stop()
+        sys.exit(1)
     http_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     http_thread.start()
 
@@ -793,20 +944,29 @@ def main():
         pass
 
     relay_status = f"Relay:   {relay_url}" if relay_url else "Relay:   (disabled - LAN only)"
-    print(f"""
-+--------------------------------------------------------------+
-|                    ChitChat v1.0.0                           |
-|                                                              |
-|  Device:     {daemon.device_name:<50s}|
-|  P2P:        tcp://0.0.0.0:{daemon._p2p_port:<40d}|
-|  Web UI:     http://{local_ip}:{daemon._http_port:<45d}|
-|  Web UI:     http://127.0.0.1:{daemon._http_port:<43d}|
-|  WebSocket:  ws://127.0.0.1:{daemon._ws_port:<42d}|
-|  {relay_status:<54s}|
-|                                                              |
-|  Open the Web UI in a browser to start chatting!             |
-+--------------------------------------------------------------+
-""")
+
+    WIDTH = 62
+    rule = "+" + "-" * WIDTH + "+"
+
+    def _row(text: str = "") -> str:
+        return "|  " + text[:WIDTH - 4].ljust(WIDTH - 4) + "  |"
+
+    lines = [
+        rule,
+        "|" + "ChitChat v1.0.0".center(WIDTH) + "|",
+        rule,
+        _row(f"Device:     {daemon.device_name}"),
+        _row(f"P2P:        tcp://0.0.0.0:{daemon._p2p_port}"),
+        _row(f"Web UI:     http://{local_ip}:{daemon._http_port}"),
+        _row(f"Web UI:     http://127.0.0.1:{daemon._http_port}"),
+        _row(f"WebSocket:  ws://{bind_ws}:{daemon._ws_port}"),
+        _row(f"Data:       {data_dir}"),
+        _row(relay_status),
+        rule,
+        _row("Open the Web UI in a browser to start chatting!"),
+        rule,
+    ]
+    print("\n" + "\n".join(lines) + "\n")
 
     async def run_async():
         daemon._loop = asyncio.get_running_loop()

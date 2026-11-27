@@ -2,25 +2,24 @@
 
 import os
 import sys
-import tempfile
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from core.store.db import MessageStore, StoredMessage, Contact
+from tests._tmp import make_tmp_dir, cleanup_tmp_dir
 
 
 class TestMessageStore:
     @classmethod
     def setup_class(cls):
-        cls._tmpdir = tempfile.mkdtemp()
+        cls._tmpdir = make_tmp_dir()
         cls.db_path = os.path.join(cls._tmpdir, "test.db")
         cls.store = MessageStore(cls.db_path)
 
     @classmethod
     def teardown_class(cls):
-        import shutil
-        shutil.rmtree(cls._tmpdir, ignore_errors=True)
+        cleanup_tmp_dir(cls._tmpdir)
 
     def setup_method(self):
         # Clean tables before each test

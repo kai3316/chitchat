@@ -95,12 +95,12 @@ class PeerConnection:
         try:
             if self._enc_mgr and self._peer_fingerprint:
                 data = self._enc_mgr.encrypt_frame(data, self._peer_fingerprint)
-                logger.info(
+                logger.debug(
                     "[%s] App-layer encrypted frame payload (%d bytes on wire)",
                     self.device_name, len(data),
                 )
             else:
-                logger.warning(
+                logger.debug(
                     "[%s] Sending unencrypted frame (%d bytes) — enc_mgr=%s peer_fp=%s",
                     self.device_name, len(data),
                     "set" if self._enc_mgr else "none",
@@ -188,8 +188,17 @@ class PeerConnection:
                     )
 
                 msg = decode_message(payload)
-                if msg and self._on_message:
-                    self._on_message(msg)
+                if msg:
+                    # The peer identity is authenticated by the TLS
+                    # certificate exchange, so it always wins over whatever
+                    # the frame claims to be.  Without this every received
+                    # message was filed under the sender's *display name*
+                    # instead of its device_id and never showed up in the
+                    # conversation.
+                    msg.source_device = self.device_id
+                    msg.source_name = self.device_name
+                    if self._on_message:
+                        self._on_message(msg)
 
             except (ConnectionError, OSError) as e:
                 end_reason = f"ConnectionError: {e}"
@@ -255,6 +264,7 @@ class TransportManager:
         self._rejected_peer_ids: set[str] = set()
         self._enc_mgr = None
         self._on_security_alert: Callable | None = None
+        self._on_peer_connected: Callable | None = None
 
     def set_encryption_manager(self, enc_mgr) -> None:
         """Set the encryption manager for app-layer encryption."""
@@ -282,22 +292,18 @@ class TransportManager:
     def _secure_scratch_dir() -> Path:
         """Per-user scratch directory for temporary key material.
 
-        Uses the platform config directory (not system /tmp) so files are
-        never world-readable and survive only as long as the app runs.
-        Stale files from previous crashes are cleaned on next startup.
+        Lives inside ChitChat's own data directory so the daemon never
+        writes into (or cleans up) another application's profile.  Key
+        files are written, loaded into the SSL context and deleted in
+        the same call; ``_cleanup_stale_scratch`` removes anything a
+        crash left behind.
         """
-        import platform
-        system = platform.system()
-        if system == "Windows":
-            base = os.environ.get("APPDATA", str(Path.home()))
-            scratch = Path(base) / "ClipSync" / ".scratch"
-        elif system == "Darwin":
-            scratch = Path.home() / "Library" / "Application Support" / "ClipSync" / ".scratch"
-        else:
-            scratch = Path.home() / ".config" / "clipsync" / ".scratch"
+        from core.config import get_data_dir
+
+        scratch = Path(get_data_dir()) / "tls"
         scratch.mkdir(parents=True, exist_ok=True)
         # On Unix, restrict permissions so only the owner can read
-        if system != "Windows":
+        if os.name != "nt":
             try:
                 scratch.chmod(0o700)
             except Exception:
@@ -306,15 +312,17 @@ class TransportManager:
 
     @staticmethod
     def _cleanup_stale_scratch():
-        """Remove any leftover key files from a previous crash."""
+        """Remove only *our own* leftover key files from a previous crash."""
         try:
             scratch = TransportManager._secure_scratch_dir()
-            for f in scratch.glob("*.pem"):
-                try:
-                    f.unlink()
-                    logger.debug("Cleaned up stale temp file: %s", f.name)
-                except OSError:
-                    pass
+            for pattern in ("identity_key_*.pem", "identity_cert_*.pem",
+                            "peer_cert_*.pem"):
+                for f in scratch.glob(pattern):
+                    try:
+                        f.unlink()
+                        logger.debug("Cleaned up stale temp file: %s", f.name)
+                    except OSError:
+                        pass
         except Exception:
             pass
 
@@ -566,6 +574,7 @@ class TransportManager:
                     return
 
                 real_peer_id = peer_id
+                real_peer_name = peer_name
                 if server_cert_data:
                     peer_cert_pem = server_cert_data.decode("ascii")
                     peer_cert = x509.load_pem_x509_certificate(peer_cert_pem.encode())
@@ -577,13 +586,24 @@ class TransportManager:
                     except Exception:
                         pass
 
+                    # The display name travels in the OU attribute so the
+                    # contact list shows the full name rather than the
+                    # 8-character name advertised over mDNS.
+                    try:
+                        ou_attrs = peer_cert.subject.get_attributes_for_oid(
+                            NameOID.ORGANIZATIONAL_UNIT_NAME)
+                        if ou_attrs and ou_attrs[0].value:
+                            real_peer_name = ou_attrs[0].value
+                    except Exception:
+                        pass
+
                     was_paired = self._pairing_mgr.is_peer_paired(real_peer_id)
                     logger.info(
                         "[%s] cert extracted: real_peer_id=%s, was_paired=%s, peer_id=%s",
                         peer_name, real_peer_id[:12], was_paired, peer_id[:12],
                     )
                     self._pairing_mgr.add_peer(
-                        real_peer_id, peer_name, peer_cert_pem,
+                        real_peer_id, real_peer_name, peer_cert_pem,
                         paired=was_paired,
                     )
                     if not was_paired:
@@ -599,7 +619,7 @@ class TransportManager:
                 # Resolve peer fingerprint for app-layer encryption
                 peer_fp = self._pairing_mgr.get_peer_fingerprint(real_peer_id) if real_peer_id else ""
 
-                conn = PeerConnection(real_peer_id, peer_name, ssl_sock,
+                conn = PeerConnection(real_peer_id, real_peer_name, ssl_sock,
                                       peer_fingerprint=peer_fp, enc_mgr=self._enc_mgr)
                 conn.set_on_message(self._on_peer_message)
                 conn.set_on_disconnect(self._on_peer_disconnected)
@@ -675,7 +695,15 @@ class TransportManager:
 
                 self._reconnect_attempts.pop(peer_id, None)
                 self._reconnect_attempts.pop(real_peer_id, None)
-                logger.info("[%s] connected [%s] (%s:%d)", peer_name, real_peer_id[:12], address, port)
+                with self._lock:
+                    survived = self._peers.get(real_peer_id) is conn
+                if survived:
+                    logger.info("[%s] connected [%s] (%s:%d)",
+                                real_peer_name, real_peer_id[:12], address, port)
+                    self._notify_peer_connected(real_peer_id, real_peer_name)
+                else:
+                    logger.info("[%s] connection superseded during tiebreak [%s]",
+                                real_peer_name, real_peer_id[:12])
 
             except CertificateChangedError:
                 logger.error(
@@ -711,13 +739,44 @@ class TransportManager:
         for conn in peers:
             conn.send(data)
 
-    def send_to_peer(self, peer_id: str, data: bytes):
+    def send_to_peer(self, peer_id: str, data: bytes) -> bool:
+        """Send ``data`` to a peer. Returns True when it was handed to the socket.
+
+        ``peer_id`` may be either the real device_id or the hashed mDNS
+        id that discovery reported before the TLS handshake resolved it.
+        """
+        real_id = self.resolve_peer_id(peer_id)
         with self._lock:
-            conn = self._peers.get(peer_id)
+            conn = self._peers.get(real_id) or self._peers.get(peer_id)
         if conn is None:
-            logger.warning("send_to_peer: peer %s not found", peer_id[:12])
-            return
-        conn.send(data)
+            logger.warning(
+                "send_to_peer: peer %s is not connected (resolved=%s)",
+                peer_id[:12], real_id[:12],
+            )
+            return False
+        return bool(conn.send(data))
+
+    def resolve_peer_id(self, peer_id: str) -> str:
+        """Resolve a hashed mDNS id to the real device_id when known."""
+        with self._lock:
+            return self._hash_to_real_id.get(peer_id, peer_id)
+
+    def is_connected(self, peer_id: str) -> bool:
+        real_id = self.resolve_peer_id(peer_id)
+        with self._lock:
+            return real_id in self._peers or peer_id in self._peers
+
+    def set_on_peer_connected(self, callback: Callable):
+        """Called with (device_id, device_name) once a peer is established."""
+        self._on_peer_connected = callback
+
+    def _notify_peer_connected(self, peer_id: str, device_name: str) -> None:
+        callback = self._on_peer_connected
+        if callback:
+            try:
+                callback(peer_id, device_name)
+            except Exception:
+                logger.exception("on_peer_connected callback failed")
 
     def get_connected_peers_with_names(self) -> list[tuple[str, str]]:
         """Return list of (peer_id, device_name) for all connected peers."""
@@ -1147,6 +1206,11 @@ class TransportManager:
                         anon_key = f"__anon__{addr[0]}:{addr[1]}"
                         self._peers[anon_key] = conn
                         logger.debug("Stored anonymous connection under %s", anon_key)
+
+                with self._lock:
+                    survived = bool(peer_id) and self._peers.get(peer_id) is conn
+                if survived:
+                    self._notify_peer_connected(peer_id, peer_name or peer_id)
 
                 logger.info("Accepted connection from %s:%d [%s]", addr[0], addr[1], peer_id[:12] if peer_id else "N/A")
 

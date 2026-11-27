@@ -1,0 +1,14 @@
+# Shell scripts must keep LF endings. With CRLF the shebang becomes
+# "#!/bin/sh^M" and macOS/Linux fail with "bad interpreter".
+*.sh text eol=lf
+
+# Windows batch files must keep CRLF endings.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Keep source and docs normalised.
+*.py text eol=lf
+*.go text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.json text eol=lf

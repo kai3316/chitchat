@@ -1629,7 +1629,8 @@ body {
       return;
     }
 
-    const wsUrl = 'ws://' + location.hostname + ':9876';
+    const wsUrl = 'ws://' + location.hostname + ':' +
+                  ((window.CHITCHAT_CONFIG && window.CHITCHAT_CONFIG.wsPort) || 9876);
     const ws = new WebSocket(wsUrl);
     state.ws = ws;
 
@@ -1779,6 +1780,26 @@ body {
       case 'group_created':
         handleGroupCreated(payload);
         break;
+      case 'group_message_received':
+        handleMessageReceived(payload);
+        break;
+      case 'contact_updated':
+        fetchContacts();
+        break;
+      case 'security_alert':
+        handleSecurityAlert(payload);
+        break;
+    }
+  }
+
+  // A peer's certificate changed, which is what a man-in-the-middle looks
+  // like. Never swallow this one silently.
+  function handleSecurityAlert(payload) {
+    var name = payload.peer_name || 'A peer';
+    showToast('Security warning: the certificate for ' + name +
+              ' changed. Verify the device before trusting it.', 'error');
+    if (window.console && console.warn) {
+      console.warn('ChitChat security alert', payload);
     }
   }
 

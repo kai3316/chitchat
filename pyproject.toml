@@ -28,9 +28,6 @@ chitchat = "core.daemon:main"
 [tool.setuptools.packages.find]
 include = ["core*"]
 
-[tool.setuptools.package-data]
-core = ["web_ui.py"]
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 timeout = 30

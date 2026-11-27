@@ -8,16 +8,15 @@ on the loopback interface.
 
 import asyncio
 import os
-import shutil
 import sys
-import tempfile
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import core.daemon as daemon_module
+import core.config as config_mod
 from core.daemon import ChitChatDaemon
 from core.store.db import StoredMessage
+from tests._tmp import make_tmp_dir, cleanup_tmp_dir
 
 
 # ── tests ────────────────────────────────────────────────────────
@@ -27,16 +26,16 @@ class TestIntegration:
 
     @classmethod
     def setup_class(cls):
-        cls._orig_data_dir = daemon_module.DATA_DIR
+        cls._orig_data_dir = config_mod.CONFIG_DIR
 
     @classmethod
     def teardown_class(cls):
-        daemon_module.DATA_DIR = cls._orig_data_dir
+        config_mod.configure(cls._orig_data_dir)
 
     def setup_method(self):
         """Fresh temp dirs for each test so stores start clean."""
-        self.tmp_a = tempfile.mkdtemp()
-        self.tmp_b = tempfile.mkdtemp()
+        self.tmp_a = make_tmp_dir()
+        self.tmp_b = make_tmp_dir()
         self.daemon_a = None
         self.daemon_b = None
 
@@ -53,19 +52,19 @@ class TestIntegration:
                 pass
         # Give the OS a moment to release ports
         time.sleep(0.2)
-        shutil.rmtree(self.tmp_a, ignore_errors=True)
-        shutil.rmtree(self.tmp_b, ignore_errors=True)
-        daemon_module.DATA_DIR = self._orig_data_dir
+        cleanup_tmp_dir(self.tmp_a)
+        cleanup_tmp_dir(self.tmp_b)
+        config_mod.configure(self._orig_data_dir)
 
     def _make_daemon_a(self, **kw):
-        daemon_module.DATA_DIR = self.tmp_a
+        config_mod.configure(self.tmp_a)
         defaults = dict(device_name="Alpha", p2p_port=19877,
                         ws_port=19876, http_port=19875)
         defaults.update(kw)
         return ChitChatDaemon(**defaults)
 
     def _make_daemon_b(self, **kw):
-        daemon_module.DATA_DIR = self.tmp_b
+        config_mod.configure(self.tmp_b)
         defaults = dict(device_name="Bravo", p2p_port=19878,
                         ws_port=19879, http_port=19880)
         defaults.update(kw)
@@ -77,7 +76,7 @@ class TestIntegration:
         """Two daemons get separate on-disk databases."""
         self.daemon_a = self._make_daemon_a()
         self.daemon_b = self._make_daemon_b()
-        daemon_module.DATA_DIR = self._orig_data_dir
+        config_mod.configure(self._orig_data_dir)
 
         peer_b = self.daemon_b._device_id
         peer_a = self.daemon_a._device_id
@@ -138,7 +137,7 @@ class TestIntegration:
         # Both daemons store their copy
         self.daemon_a = self._make_daemon_a()
         self.daemon_b = self._make_daemon_b()
-        daemon_module.DATA_DIR = self._orig_data_dir
+        config_mod.configure(self._orig_data_dir)
 
         peer_b = self.daemon_b._device_id
         peer_a = self.daemon_a._device_id
@@ -161,7 +160,7 @@ class TestIntegration:
         """Exercise RPC methods directly (no transport needed)."""
         self.daemon_a = self._make_daemon_a()
         self.daemon_b = self._make_daemon_b()
-        daemon_module.DATA_DIR = self._orig_data_dir
+        config_mod.configure(self._orig_data_dir)
 
         peer_b = self.daemon_b._device_id
 
@@ -225,7 +224,7 @@ class TestIntegration:
     def test_contact_lifecycle(self):
         """Add, list, and remove contacts through the store."""
         self.daemon_a = self._make_daemon_a()
-        daemon_module.DATA_DIR = self._orig_data_dir
+        config_mod.configure(self._orig_data_dir)
 
         store = self.daemon_a.store
 
@@ -258,7 +257,7 @@ class TestIntegration:
         """get_history returns messages in chronological order."""
         self.daemon_a = self._make_daemon_a()
         self.daemon_b = self._make_daemon_b()
-        daemon_module.DATA_DIR = self._orig_data_dir
+        config_mod.configure(self._orig_data_dir)
 
         store = self.daemon_a.store
         peer = self.daemon_b._device_id

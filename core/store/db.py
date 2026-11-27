@@ -80,7 +80,8 @@ class MessageStore:
 
     def __init__(self, db_path: str = ""):
         if not db_path:
-            db_path = os.path.join(os.path.expanduser("~"), ".chitchat", "chitchat.db")
+            from core.config import get_data_dir
+            db_path = os.path.join(get_data_dir(), "chitchat.db")
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self._db_path = db_path
         self._lock = threading.Lock()
@@ -320,6 +321,73 @@ class MessageStore:
             finally:
                 conn.close()
 
+    def adopt_contact_aliases(self, real_id: str, aliases) -> list[str]:
+        """Merge contact rows that were filed under a temporary id.
+
+        Older builds stored contacts and messages under the hashed mDNS
+        id (or, worse, the sender's display name).  Once the authenticated
+        device_id is known, fold those rows into it so a peer appears once
+        and its history shows up in the conversation.
+
+        Returns the alias ids that were actually adopted.
+        """
+        adopted: list[str] = []
+        if not real_id:
+            return adopted
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                for alias in aliases:
+                    if not alias or alias == real_id:
+                        continue
+                    row = conn.execute(
+                        "SELECT * FROM contacts WHERE device_id = ?", (alias,)
+                    ).fetchone()
+                    has_messages = conn.execute(
+                        "SELECT 1 FROM messages WHERE peer_id = ? LIMIT 1", (alias,)
+                    ).fetchone()
+                    if row is None and not has_messages:
+                        continue
+
+                    # Move history over first so the FK-like bookkeeping
+                    # below (unread counters) stays consistent.
+                    conn.execute(
+                        "UPDATE OR IGNORE messages SET peer_id = ? WHERE peer_id = ?",
+                        (real_id, alias),
+                    )
+                    if row is not None:
+                        target = conn.execute(
+                            "SELECT * FROM contacts WHERE device_id = ?", (real_id,)
+                        ).fetchone()
+                        if target is None:
+                            conn.execute(
+                                "INSERT INTO contacts (device_id, device_name, paired, "
+                                "last_message, last_time, unread_count, is_group, member_count) "
+                                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                (real_id, row["device_name"], row["paired"],
+                                 row["last_message"], row["last_time"],
+                                 row["unread_count"], row["is_group"],
+                                 row["member_count"]),
+                            )
+                        else:
+                            newer = row["last_time"] > target["last_time"]
+                            conn.execute(
+                                "UPDATE contacts SET "
+                                "last_message = CASE WHEN ? THEN ? ELSE last_message END, "
+                                "last_time = MAX(last_time, ?), "
+                                "unread_count = unread_count + ?, "
+                                "paired = MAX(paired, ?) "
+                                "WHERE device_id = ?",
+                                (int(newer), row["last_message"], row["last_time"],
+                                 row["unread_count"], row["paired"], real_id),
+                            )
+                        conn.execute("DELETE FROM contacts WHERE device_id = ?", (alias,))
+                    adopted.append(alias)
+                conn.commit()
+            finally:
+                conn.close()
+        return adopted
+
     # ── Groups ─────────────────────────────────────────────────
 
     def create_group(self, group_id: str, name: str, members: list[str],
@@ -352,6 +420,43 @@ class MessageStore:
                 )
             finally:
                 conn.close()
+
+    def ensure_group(self, group_id: str, name: str, members: list[str],
+                     created_by: str = "") -> GroupInfo:
+        """Create the group if this device has not seen it yet.
+
+        Used when a ``group_invite`` (or a group message that overtook
+        its invite) arrives, so the conversation exists locally before
+        messages are filed into it.
+        """
+        existing = self.get_group(group_id)
+        if existing is not None:
+            return existing
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                now = time.time()
+                member_list = list(dict.fromkeys(members))
+                conn.execute(
+                    "INSERT OR IGNORE INTO groups (group_id, name, members, created_by, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (group_id, name or "Group", json.dumps(member_list), created_by, now),
+                )
+                for mid in member_list:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO group_members (group_id, device_id, device_name, joined_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (group_id, mid, mid, now),
+                    )
+                conn.execute(
+                    "INSERT OR REPLACE INTO contacts (device_id, device_name, is_group, member_count) "
+                    "VALUES (?, ?, 1, ?)",
+                    (group_id, name or "Group", len(member_list)),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        return self.get_group(group_id)
 
     def get_groups(self) -> list[GroupInfo]:
         with self._lock:

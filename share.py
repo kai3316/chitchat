@@ -6,7 +6,7 @@ Usage:
     python share.py --target all    # all platforms
 
 This creates a self-contained zip that another device can extract and run
-with just: python setup.py
+with just: python install.py
 """
 
 import os
@@ -21,7 +21,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 INCLUDE = [
     "core/",
     "requirements.txt",
-    "setup.py",
+    "install.py",
     "pyproject.toml",
     "run.bat",
     "run.sh",
@@ -82,7 +82,7 @@ def main():
 To use on another device:
   1. Copy chitchat-share.zip to the other device
   2. Extract it
-  3. Run: python setup.py     (first-time setup)
+  3. Run: python install.py     (first-time setup)
   4. Run: python -m core.daemon (or use run.bat/run.sh)
 
 Both devices on the same WiFi/LAN will auto-discover each other.

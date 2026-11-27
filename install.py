@@ -2,12 +2,16 @@
 """ChitChat one-click cross-platform installer.
 
 Usage:
-    python setup.py              # auto-detect, install deps, create launchers
-    python setup.py --relay URL  # also configure relay server
+    python install.py              # auto-detect, install deps, create launchers
+    python install.py --relay URL  # also configure relay server
 
 This script works on Windows, macOS, and Linux. It creates a virtual
 environment, installs Python dependencies, and generates OS-specific
 launcher shortcuts.
+
+Note: this is the end-user installer, not a setuptools script. The
+package metadata lives in pyproject.toml, so ``pip install .`` installs
+the daemon without ever running this file.
 """
 
 import argparse
@@ -30,39 +34,59 @@ def detect_os():
         return "linux"
 
 
-def find_python():
-    """Find the best Python 3 interpreter."""
-    # Python 3.13+ on Windows might be in Windows Apps
-    for cmd in ["python3", "python"]:
-        try:
-            out = subprocess.check_output(
-                [cmd, "--version"], stderr=subprocess.STDOUT, text=True
-            )
-            if "Python 3" in out:
-                return cmd
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            continue
+MIN_PYTHON = (3, 10)
 
-    print("ERROR: Python 3.10+ is required. Install from https://python.org")
+
+def _version_ok(cmd):
+    """Return True when ``cmd`` is a Python >= MIN_PYTHON interpreter."""
+    try:
+        out = subprocess.check_output(
+            [cmd, "--version"], stderr=subprocess.STDOUT, text=True
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError, OSError):
+        return False
+    # Expect "Python 3.12.4"; keep only the numeric part.
+    match = out.strip().split()
+    if len(match) < 2:
+        return False
+    try:
+        parts = tuple(int(p) for p in match[1].split(".")[:2])
+    except ValueError:
+        return False
+    return parts >= MIN_PYTHON
+
+
+def find_python():
+    """Find the best Python >= 3.10 interpreter to build the venv with."""
+    # The interpreter running this script is the safest choice.
+    candidates = [sys.executable, "python3", "python", "py"]
+    for cmd in candidates:
+        if not cmd:
+            continue
+        if _version_ok(cmd):
+            return cmd
+
+    print(f"ERROR: Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ is required. "
+          "Install it from https://python.org")
     sys.exit(1)
 
 
 def create_venv():
     """Create virtual environment if it doesn't exist."""
-    if os.path.exists(VENV_DIR):
+    if os.path.exists(os.path.join(VENV_DIR, "pyvenv.cfg")):
         print(f"  Virtual environment already exists: {VENV_DIR}")
         return
 
-    print(f"  Creating virtual environment...")
+    print("  Creating virtual environment...")
     venv.create(VENV_DIR, with_pip=True)
 
 
 def pip_install():
-    """Install dependencies into the venv."""
+    """Install dependencies into the venv. Returns True on success."""
     req = os.path.join(SCRIPT_DIR, "requirements.txt")
     if not os.path.exists(req):
         print("  WARNING: requirements.txt not found, skipping pip install")
-        return
+        return True
 
     if sys.platform == "win32":
         pip = os.path.join(VENV_DIR, "Scripts", "pip.exe")
@@ -70,64 +94,82 @@ def pip_install():
         pip = os.path.join(VENV_DIR, "bin", "pip")
 
     print("  Installing dependencies...")
-    subprocess.check_call([pip, "install", "-r", req, "--quiet"])
+    try:
+        subprocess.check_call([pip, "install", "-r", req, "--quiet"])
+    except (subprocess.CalledProcessError, OSError) as exc:
+        print(f"\n  ERROR: dependency installation failed ({exc}).")
+        print("  Check your internet connection, then run: python install.py")
+        return False
+    return True
 
 
-def create_windows_shortcut(name, target, args=""):
-    """Create a .bat shortcut on Windows."""
+def create_windows_shortcut(name, args=""):
+    """Create a .bat shortcut on Windows.
+
+    The launcher must run ``-m core.daemon`` from the project root: running
+    ``core/daemon.py`` directly puts ``core/`` on sys.path and the
+    ``import core.*`` statements fail.
+    """
     bat_path = os.path.join(SCRIPT_DIR, f"{name}.bat")
-    if target.endswith(".py"):
-        python = os.path.join(VENV_DIR, "Scripts", "python.exe")
-        content = f'@"{python}" "{target}" {args} %*\npause\n'
-    else:
-        content = f'@"{target}" {args} %*\n'
+    python = os.path.join(VENV_DIR, "Scripts", "python.exe")
+    content = (
+        "@echo off\r\n"
+        'cd /d "%~dp0"\r\n'
+        f'"{python}" -m core.daemon {args} %*\r\n'
+        "pause\r\n"
+    )
 
-    with open(bat_path, "w") as f:
+    with open(bat_path, "w", newline="") as f:
         f.write(content)
     print(f"  Launcher created: {bat_path}")
 
 
-def create_linux_shortcut(name, target, args=""):
-    """Create a shell launcher and .desktop file on Linux."""
-    # Shell script
+def create_linux_shortcut(name, args=""):
+    """Create a shell launcher (Linux and macOS).
+
+    ``readlink -f`` is intentionally not used: macOS ships a BSD
+    ``readlink`` that does not support ``-f`` until very recent versions.
+    Changing into the script's own directory works everywhere.
+    """
     sh_path = os.path.join(SCRIPT_DIR, name)
-    if target.endswith(".py"):
-        python = os.path.join(VENV_DIR, "bin", "python")
-        content = f'#!/usr/bin/env bash\ncd "$(dirname "$BASH_SOURCE")"\nexec "{python}" "{target}" {args} "$@"\n'
-    else:
-        content = f'#!/usr/bin/env bash\ncd "$(dirname "$BASH_SOURCE")"\nexec "{target}" {args} "$@"\n'
+    python = os.path.join(VENV_DIR, "bin", "python")
+    content = (
+        '#!/bin/sh\n'
+        'cd "$(dirname "$0")" || exit 1\n'
+        f'exec "{python}" -m core.daemon {args} "$@"\n'
+    )
 
     with open(sh_path, "w") as f:
         f.write(content)
     os.chmod(sh_path, 0o755)
     print(f"  Launcher created: {sh_path}")
 
-    # .desktop file for app menu
-    desktop_dir = os.path.expanduser("~/.local/share/applications")
-    os.makedirs(desktop_dir, exist_ok=True)
-    desktop_path = os.path.join(desktop_dir, f"chitchat-{name}.desktop")
-    icon = os.path.join(SCRIPT_DIR, "icon.png")
+    # .desktop file for the Linux app menu (not used on macOS)
+    if sys.platform != "darwin":
+        desktop_dir = os.path.expanduser("~/.local/share/applications")
+        os.makedirs(desktop_dir, exist_ok=True)
+        desktop_path = os.path.join(desktop_dir, f"chitchat-{name}.desktop")
 
-    # Determine if this is the daemon or just a helper
-    if name == "chitchat":
-        desktop_content = f"""[Desktop Entry]
+        if name == "chitchat":
+            icon = os.path.join(SCRIPT_DIR, "icon.png")
+            icon_line = f"Icon={icon}\n" if os.path.exists(icon) else ""
+            desktop_content = f"""[Desktop Entry]
 Name=ChitChat
 Comment=Secure P2P Chat
 Exec={sh_path}
-Icon={icon}
-Terminal=true
+{icon_line}Terminal=true
 Type=Application
 Categories=Network;Chat;
 Keywords=chat;p2p;encrypted;
 """
-        with open(desktop_path, "w") as f:
-            f.write(desktop_content)
-        os.chmod(desktop_path, 0o644)
-        print(f"  Desktop entry: {desktop_path}")
+            with open(desktop_path, "w") as f:
+                f.write(desktop_content)
+            os.chmod(desktop_path, 0o644)
+            print(f"  Desktop entry: {desktop_path}")
 
 
 def create_macos_app():
-    """Create a macOS .app bundle wrapper."""
+    """Create a macOS .app bundle wrapper that opens the web UI."""
     app_dir = os.path.join(SCRIPT_DIR, "ChitChat.app")
     macos_dir = os.path.join(app_dir, "Contents", "MacOS")
     resources_dir = os.path.join(app_dir, "Contents", "Resources")
@@ -135,17 +177,20 @@ def create_macos_app():
     os.makedirs(resources_dir, exist_ok=True)
 
     python = os.path.join(VENV_DIR, "bin", "python")
-    daemon_path = os.path.join(SCRIPT_DIR, "core", "daemon.py")
 
     # Info.plist
-    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+    plist = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key><string>ChitChat</string>
+    <key>CFBundleDisplayName</key><string>ChitChat</string>
     <key>CFBundleIdentifier</key><string>chat.chitchat.app</string>
     <key>CFBundleVersion</key><string>1.0.0</string>
+    <key>CFBundleShortVersionString</key><string>1.0.0</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleExecutable</key><string>chitchat.sh</string>
+    <key>NSHighResolutionCapable</key><true/>
     <key>LSUIElement</key><true/>
 </dict>
 </plist>"""
@@ -153,9 +198,10 @@ def create_macos_app():
     with open(os.path.join(app_dir, "Contents", "Info.plist"), "w") as f:
         f.write(plist)
 
-    # Executable
-    launcher = f"""#!/usr/bin/env bash
-cd "{SCRIPT_DIR}"
+    # Executable: start the daemon, then open the browser once it is up.
+    launcher = f"""#!/bin/bash
+cd "{SCRIPT_DIR}" || exit 1
+( sleep 3; open http://127.0.0.1:9875 ) &
 exec "{python}" -m core.daemon "$@"
 """
     launcher_path = os.path.join(macos_dir, "chitchat.sh")
@@ -167,8 +213,10 @@ exec "{python}" -m core.daemon "$@"
 
 
 def save_config(relay_url=""):
-    """Save daemon config file."""
-    config_dir = os.path.join(os.path.expanduser("~"), ".chitchat")
+    """Save the daemon config file into the active data directory."""
+    data_dir = os.environ.get("CHITCHAT_HOME", "").strip() or os.path.join(
+        os.path.expanduser("~"), ".chitchat")
+    config_dir = os.path.abspath(os.path.expanduser(data_dir))
     os.makedirs(config_dir, exist_ok=True)
 
     import json
@@ -208,21 +256,21 @@ def main():
     create_venv()
 
     # Step 3: Install dependencies
-    pip_install()
+    if not pip_install():
+        sys.exit(1)
 
     # Step 4: Save config
     save_config(args.relay)
 
     # Step 5: Create launchers
     if not args.no_shortcuts:
-        daemon = os.path.join(SCRIPT_DIR, "core", "daemon.py")
         if os_type == "windows":
-            create_windows_shortcut("Start-ChitChat", daemon, "--name My-PC")
+            create_windows_shortcut("Start-ChitChat", "--name My-PC")
         elif os_type == "macos":
-            create_linux_shortcut("chitchat", daemon, "--name My-Mac")
+            create_linux_shortcut("chitchat", "--name My-Mac")
             create_macos_app()
         else:
-            create_linux_shortcut("chitchat", daemon, "--name My-Linux")
+            create_linux_shortcut("chitchat", "--name My-Linux")
 
     # Step 6: Print instructions
     print(f"""
@@ -242,7 +290,7 @@ def main():
 |                                                      |
 |  On another device:                                  |
 |    1. Copy this entire folder to the other device    |
-|    2. Run: python setup.py                           |
+|    2. Run: python install.py                         |
 |    3. Start the daemon and open the Web UI           |
 |    4. Both devices auto-discover on the same LAN     |
 |                                                      |
